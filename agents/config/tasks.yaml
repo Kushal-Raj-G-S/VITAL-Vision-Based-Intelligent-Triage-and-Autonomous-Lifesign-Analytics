@@ -1,0 +1,22 @@
+vitals_extraction_task:
+  description: "Analyze the patient video file located at '{video_path}' using the Vitals Extraction Tool. Extract the patient's heart rate (BPM), respiratory rate (RR), HRV, stress index, and other signal diagnostics. Review the results returned by the tool and output a structured summary of the extracted vitals. Ensure you do not guess or fabricate values. Only report what the tool returns."
+  expected_output: "A structured clinical summary of the patient's extracted biometrics and signal diagnostics."
+  agent: perception_agent
+
+diagnostic_triage_task:
+  description: "Using the biometrics extracted by the Perception Agent, perform a clinical diagnostic check based on the project's ESI and Compensated Shock guidelines:
+                1. ESI Levels:
+                   - Level 1 (Resuscitation): Immediate life-saving intervention needed (e.g., cardiac arrest, severe trauma).
+                   - Level 2 (Emergent): Within 10-15 minutes (e.g., chest pain, stroke, severe asthma).
+                   - Level 3 (Urgent): Within 30-60 minutes (e.g., abdominal pain, moderate high fever, or stable vitals but abnormal stress index/respiration requiring multiple resources).
+                   - Level 4 (Semi-Urgent): Within 1-2 hours (e.g., sprained ankle, earache, small cuts).
+                   - Level 5 (Non-Urgent): Routine consults/refills (e.g., cold symptoms, prescription refills).
+                2. Compensated Shock: Check for multivariate correlation: Respiration Rate > 20 bpm (Tachypnea) and Heart Rate > 100 bpm (Tachycardia).
+                Output your final clinical assessment including: ESI Level (1 to 5), diagnostic reasoning (referencing the guidelines above), risk level, and a list of key metrics. Ground your findings strictly in these rules."
+  expected_output: "A detailed clinical diagnostic report containing ESI classification, risk assessment (e.g., Shock flags), and explainable reasoning grounded in guidelines."
+  agent: diagnostic_agent
+
+prioritization_coordination_task:
+  description: "Take the clinical assessment from the Diagnostic Agent and determine the patient's priority within the emergency department. Formulate a final triage recommendation, including the ESI level (1-5), patient status, and key clinical alerts (e.g., Shock Alert). Output a structured JSON response containing: 'esi_level' (integer 1-5), 'priority_score' (1-100, where higher means more urgent), 'primary_diagnosis', 'is_shock' (boolean), and a concise 'triage_summary' explaining the reasoning."
+  expected_output: "A structured triage recommendation and queue prioritization summary in JSON format."
+  agent: coordinator_agent
