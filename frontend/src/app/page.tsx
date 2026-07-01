@@ -76,7 +76,7 @@ export default function Home() {
   // Connection and settings state
   const [backendOnline, setBackendOnline] = useState<boolean>(false);
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
-  const [selectedCamera, setSelectedCamera] = useState<number | null>(null);
+  const [selectedCamera, setSelectedCamera] = useState<number>(-99);
   
   // Real-time metric states
   const [metrics, setMetrics] = useState<Metrics>({
