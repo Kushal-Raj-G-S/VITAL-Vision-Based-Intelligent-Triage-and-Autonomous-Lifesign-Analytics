@@ -120,7 +120,7 @@ graph TD
 ```
 
 # Sequence Diagram
-<img src="frontend\diagram.png" width="80%" alt="Sequence Diagram"/>
+<img src="frontend/diagram.png" width="80%" alt="Sequence Diagram"/>
 
 # 🕵️ The Triage Crew Swarm
 
