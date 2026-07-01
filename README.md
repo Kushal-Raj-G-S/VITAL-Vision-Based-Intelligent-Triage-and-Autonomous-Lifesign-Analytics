@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="vital_logo.png" width="120" alt="VITAL Logo"/>
+<img src="vital_logo.png" width="150" alt="VITAL Logo"/>
 
 # VITAL: Vision-Based Intelligent Triage and Autonomous Lifesign Analytics
 
@@ -120,7 +120,7 @@ graph TD
 ```
 
 # Sequence Diagram
-<img src="frontend/diagram.png" width="80%" alt="Sequence Diagram"/>
+<img src="frontend/diagram.png" width="100%" alt="Sequence Diagram"/>
 
 # 🕵️ The Triage Crew Swarm
 
