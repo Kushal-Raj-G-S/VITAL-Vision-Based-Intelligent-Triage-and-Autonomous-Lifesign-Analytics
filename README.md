@@ -119,8 +119,8 @@ graph TD
     ARIA --> NIM[NVIDIA NIM Llama 3.3]
 ```
 
-<img src="frontend\diagram.png" width="120" alt="Sequence Diagram"/>
----
+<img src="frontend\diagram.png" width="100%" alt="Sequence Diagram"/>
+
 
 # 🕵️ The Triage Crew Swarm
 
