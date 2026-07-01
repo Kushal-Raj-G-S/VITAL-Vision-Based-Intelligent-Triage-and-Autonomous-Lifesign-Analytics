@@ -60,9 +60,11 @@ interface Metrics {
 type NavigationTab = 'monitor' | 'queue' | 'crew' | 'chat';
 
 export default function Home() {
-  const BACKEND_URL = typeof window !== 'undefined' 
-    ? `http://${window.location.hostname}:5002` 
-    : "http://127.0.0.1:5002";
+  const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || (
+    typeof window !== 'undefined' 
+      ? `http://${window.location.hostname}:5002` 
+      : "http://127.0.0.1:5002"
+  );
 
   console.log("[VITAL] Home component rendered! BACKEND_URL is:", BACKEND_URL);
 
