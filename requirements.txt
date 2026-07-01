@@ -7,8 +7,8 @@ mediapipe>=0.10.0
 certifi
 python-dotenv
 google-generativeai
-crewai
-langchain
+crewai==0.28.8
+langchain>=0.1.0,<0.2.0
 langchain-nvidia-ai-endpoints
 langchain-groq
 flask-cors
