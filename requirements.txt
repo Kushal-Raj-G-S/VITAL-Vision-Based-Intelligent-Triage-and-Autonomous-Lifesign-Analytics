@@ -13,3 +13,4 @@ langchain-nvidia-ai-endpoints
 langchain-groq
 flask-cors
 psycopg2-binary
+gunicorn
