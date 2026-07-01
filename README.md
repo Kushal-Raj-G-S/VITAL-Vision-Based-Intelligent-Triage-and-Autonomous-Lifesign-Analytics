@@ -54,6 +54,7 @@ VITAL addresses three major limitations identified in emergency medicine literat
 * **Fitzpatrick Inclusivity**: mediaPipe 468-point Face Mesh isolates forehead and cheek ROI landmarks for illumination-blind blood volume pulse tracking.
 * **Environmental Guards**: Automatically measures BT.601 luminance (lux) and centroid drift (motion delta) to flag sensor noise or target motion.
 * **Haar Fallback**: Operates fully on Haar Cascades if MediaPipe components are missing.
+* **Client Browser Webcam Support**: Allows remote devices (smartphones, tablets, or laptops on the local network) to capture local video via HTML5 `getUserMedia` and stream base64 frames to the backend `/api/stream_frame` at 14 FPS for central processing, returning real-time tracking overlay feedback.
 
 ## 🤖 Multi-Agent Triage Crew
 * **Perception Specialist Agent**: Consolidates raw telemetry from live streams or video files.
@@ -64,6 +65,11 @@ VITAL addresses three major limitations identified in emergency medicine literat
 * **Context Ingestion**: Inherits read-only privileges to query Neon PostgreSQL patient records.
 * **Multimodal OCR**: Allows uploading patient intake charts or clinical sheets, parsing the images directly.
 * **Voice-Activated**: Integrates speech-to-text (STT) voice recognition and text-to-speech (TTS) playback in Next.js.
+* **Clinical Consult Split-Workspace**: Features a dynamic sidebar that loads patient history telemetry cards. Toggles manually via dropdown or syncs conversationally when a patient's name is mentioned in chat.
+
+## 💻 Fluid Collapsible Sidebar Layout
+* **Carbon-Slate Dark Theme**: High-fidelity theme with slate-obsidian translucent cards, clinical sky-blue outlines, status indicators, and an expanded widescreen canvas.
+* **Liquid CSS Transitions**: Sidebar collapses/expands smoothly with layout-stable icon boxes and CSS max-width/opacity fading, avoiding any sudden visual snapping.
 
 ## 🗄️ Serverless Postgres Persistence
 * All telemetry data, ESI levels, diagnostic summaries, and coordinator prioritizations are saved to a Neon database.
@@ -186,7 +192,7 @@ Start the Flask server:
 ```bash
 python app.py
 ```
-*API Backend launches on `http://localhost:5002`*
+*API Backend binds to all interfaces and launches on `http://localhost:5002`
 
 ### 2. Next.js Dashboard Setup
 ```bash
@@ -194,7 +200,10 @@ cd frontend
 npm install
 npm run dev
 ```
-*SaaS Dashboard launches on `http://localhost:3000`*
+*SaaS Dashboard launches on `http://localhost:3000`.*
+
+> [!NOTE]
+> **Local Network Testing**: The frontend dynamically resolves `BACKEND_URL` using `window.location.hostname` (rather than hardcoded localhost). You can access the triage dashboard on any local network device (e.g. tablet or phone) at `http://<your-computer-ip>:3000` and it will automatically pair with the backend and local camera capture correctly.
 
 ---
 

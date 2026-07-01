@@ -20,6 +20,10 @@ interface PatientRecord {
   is_shock: boolean;
   triage_summary: string;
   agent_output: string;
+  heart_rate?: number;
+  respiration?: number;
+  hrv?: number;
+  stress_index?: number;
 }
 
 interface CameraDevice {
@@ -53,13 +57,18 @@ interface Metrics {
   face_detected?: boolean;
 }
 
-const BACKEND_URL = "http://127.0.0.1:5002";
-
 type NavigationTab = 'monitor' | 'queue' | 'crew' | 'chat';
 
 export default function Home() {
-  // Navigation
+  const BACKEND_URL = typeof window !== 'undefined' 
+    ? `http://${window.location.hostname}:5002` 
+    : "http://127.0.0.1:5002";
+
+  console.log("[VITAL] Home component rendered! BACKEND_URL is:", BACKEND_URL);
+
+  // Navigation & Layout states
   const [activeTab, setActiveTab] = useState<NavigationTab>('monitor');
+  const [sidebarExpanded, setSidebarExpanded] = useState<boolean>(true);
 
   // Connection and settings state
   const [backendOnline, setBackendOnline] = useState<boolean>(false);
@@ -82,6 +91,7 @@ export default function Home() {
   const [triageQueue, setTriageQueue] = useState<PatientRecord[]>([]);
   const [isTriageRunning, setIsTriageRunning] = useState<boolean>(false);
   const [lastTriageResult, setLastTriageResult] = useState<PatientRecord | null>(null);
+  const [selectedConsultPatientId, setSelectedConsultPatientId] = useState<string | null>(null);
   const [activeAgentTab, setActiveAgentTab] = useState<'perception' | 'diagnostic' | 'coordinator'>('perception');
   
   // Chat state
@@ -115,23 +125,34 @@ export default function Home() {
   // Polling intervals
   const statusPollInterval = useRef<NodeJS.Timeout | null>(null);
 
+  // Client-side browser camera streaming references
+  const [browserAnnotatedFrame, setBrowserAnnotatedFrame] = useState<string | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const streamLoopRef = useRef<any>(null);
+
   // 1. Verify Backend Online and fetch cameras & queue
   const checkBackendStatus = async () => {
+    console.log("[VITAL] Attempting backend status check to:", `${BACKEND_URL}/api/cameras`);
     try {
       const res = await fetch(`${BACKEND_URL}/api/cameras`);
       if (res.ok) {
         setBackendOnline(true);
         const data = await res.json();
-        setCameras(data.cameras || []);
+        const serverCams = data.cameras || [];
+        const browserCam: CameraDevice = { index: -99, label: "💻 Client Browser Webcam" };
+        setCameras([browserCam, ...serverCams]);
         if (data.default !== null && data.default !== undefined) {
-          setSelectedCamera((prev) => prev !== null ? prev : data.default);
+          setSelectedCamera((prev) => prev !== null ? prev : -99);
         }
         fetchQueue();
       } else {
+        console.warn("[VITAL] Status check failed. Server returned status:", res.status);
         setBackendOnline(false);
         sessionStartedRef.current = false; // backend went offline, allow re-start
       }
     } catch (e) {
+      console.error("[VITAL] Connection failed. Check CORS, firewalls, or server state:", e);
       setBackendOnline(false);
       sessionStartedRef.current = false;
     }
@@ -237,7 +258,7 @@ export default function Home() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     
     // Draw background grid
-    ctx.strokeStyle = 'rgba(6, 182, 212, 0.04)';
+    ctx.strokeStyle = theme === 'light' ? 'rgba(15, 23, 42, 0.03)' : 'rgba(255, 255, 255, 0.02)';
     ctx.lineWidth = 1;
     for (let i = 0; i < canvas.width; i += 40) {
       ctx.beginPath();
@@ -255,7 +276,7 @@ export default function Home() {
     const signal = metrics.ppg_signal || [];
     if (signal.length === 0) {
       // Draw idle scanning line
-      ctx.strokeStyle = 'rgba(6, 182, 212, 0.2)';
+      ctx.strokeStyle = theme === 'light' ? 'rgba(15, 23, 42, 0.15)' : 'rgba(56, 189, 248, 0.2)';
       ctx.lineWidth = 2.5;
       ctx.beginPath();
       ctx.moveTo(0, canvas.height / 2);
@@ -281,17 +302,24 @@ export default function Home() {
     ctx.closePath();
     
     const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
-    grad.addColorStop(0, 'rgba(6, 182, 212, 0.20)');
-    grad.addColorStop(1, 'rgba(6, 182, 212, 0.00)');
+    if (theme === 'light') {
+      grad.addColorStop(0, 'rgba(8, 145, 178, 0.15)');
+      grad.addColorStop(1, 'rgba(8, 145, 178, 0.00)');
+    } else {
+      grad.addColorStop(0, 'rgba(56, 189, 248, 0.12)');
+      grad.addColorStop(1, 'rgba(56, 189, 248, 0.00)');
+    }
     ctx.fillStyle = grad;
     ctx.fill();
 
     // Draw the neon stroke line
     ctx.beginPath();
-    ctx.strokeStyle = 'rgba(6, 182, 212, 0.95)';
-    ctx.lineWidth = 3;
-    ctx.shadowBlur = 12;
-    ctx.shadowColor = 'rgba(6, 182, 212, 0.7)';
+    ctx.strokeStyle = theme === 'light' ? 'rgba(8, 145, 178, 0.9)' : 'rgba(56, 189, 248, 0.95)';
+    ctx.lineWidth = 2.5;
+    if (theme !== 'light') {
+      ctx.shadowBlur = 10;
+      ctx.shadowColor = 'rgba(56, 189, 248, 0.5)';
+    }
 
     for (let i = 0; i < signal.length; i++) {
       const x = (i / (signal.length - 1)) * canvas.width;
@@ -304,7 +332,7 @@ export default function Home() {
     }
     ctx.stroke();
     ctx.shadowBlur = 0; // reset
-  }, [metrics.ppg_signal, metrics.status, activeTab]);
+  }, [metrics.ppg_signal, metrics.status, activeTab, theme]);
 
   // 3. Audio Recording STT / Voice Input
   useEffect(() => {
@@ -353,6 +381,68 @@ export default function Home() {
   // 5. Handlers
   const handleStartWebcam = async () => {
     setUploadMessage({ text: '', type: '' });
+    
+    // Check if client browser camera is selected
+    if (selectedCamera === -99) {
+      try {
+        if (streamLoopRef.current) {
+          clearInterval(streamLoopRef.current);
+          streamLoopRef.current = null;
+        }
+        if (localStreamRef.current) {
+          localStreamRef.current.getTracks().forEach(t => t.stop());
+          localStreamRef.current = null;
+        }
+        
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, frameRate: 30 }
+        });
+        localStreamRef.current = stream;
+        
+        if (!localVideoRef.current) {
+          localVideoRef.current = document.createElement('video');
+          localVideoRef.current.autoplay = true;
+          localVideoRef.current.playsInline = true;
+        }
+        localVideoRef.current.srcObject = stream;
+        await localVideoRef.current.play();
+        
+        const canvas = document.createElement('canvas');
+        canvas.width = 640;
+        canvas.height = 480;
+        const ctx = canvas.getContext('2d');
+        
+        const loop = setInterval(async () => {
+          if (!localVideoRef.current || !localStreamRef.current || !ctx) return;
+          ctx.drawImage(localVideoRef.current, 0, 0, 640, 480);
+          const base64Img = canvas.toDataURL('image/jpeg', 0.7);
+          
+          try {
+            const res = await fetch(`${BACKEND_URL}/api/stream_frame`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ image: base64Img })
+            });
+            const frameData = await res.json();
+            if (frameData.success) {
+              setBrowserAnnotatedFrame(frameData.annotated_image);
+              setMetrics(frameData.metrics);
+            }
+          } catch (err) {
+            console.error("Browser webcam frame upload error:", err);
+          }
+        }, 70); // ~14 FPS is ideal to prevent network lag while keeping rPPG signal smooth
+        
+        streamLoopRef.current = loop;
+        setMetrics(m => ({ ...m, is_live: true, status: 'CALIBRATING', calibration_progress: 0 }));
+        setUploadMessage({ text: 'Client browser webcam streaming active.', type: 'success' });
+      } catch (err: any) {
+        console.error("Error starting browser webcam stream:", err);
+        setUploadMessage({ text: `Camera access failed: ${err.message || err}`, type: 'error' });
+      }
+      return;
+    }
+
     try {
       const res = await fetch(`${BACKEND_URL}/start_webcam`, {
         method: 'POST',
@@ -373,6 +463,18 @@ export default function Home() {
   };
 
   const handleReleaseCamera = async () => {
+    // Clear local client webcam loops if active
+    if (streamLoopRef.current) {
+      clearInterval(streamLoopRef.current);
+      streamLoopRef.current = null;
+    }
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(t => t.stop());
+      localStreamRef.current = null;
+    }
+    setBrowserAnnotatedFrame(null);
+    setMetrics(m => ({ ...m, is_live: false, status: 'DISCONNECTED' }));
+
     try {
       await fetch(`${BACKEND_URL}/release_camera`, { method: 'POST' });
       setUploadMessage({ text: 'Optical hardware released.', type: 'success' });
@@ -484,6 +586,16 @@ export default function Home() {
       content: chatInput,
       image: selectedImage || undefined
     };
+
+    // Client-side instant match for patient name in clinician input query
+    const textToSearch = chatInput.toLowerCase().trim();
+    const matched = triageQueue.find(p => {
+      const pName = p.name.toLowerCase().trim();
+      return pName.length > 2 && textToSearch.includes(pName);
+    });
+    if (matched) {
+      setSelectedConsultPatientId(matched.id);
+    }
     
     const updatedHistory = [...chatHistory, userMsg];
     setChatHistory(updatedHistory);
@@ -498,7 +610,8 @@ export default function Home() {
         body: JSON.stringify({ 
           message: userMsg.content, 
           history: chatHistory.map(m => ({ role: m.role, content: m.content })),
-          image: userMsg.image 
+          image: userMsg.image,
+          selected_patient_id: selectedConsultPatientId
         })
       });
       const data = await res.json();
@@ -506,6 +619,9 @@ export default function Home() {
         const modelMsg: ChatMessage = { role: 'model', content: data.response };
         setChatHistory([...updatedHistory, modelMsg]);
         speakText(data.response);
+        if (data.matched_patient_id) {
+          setSelectedConsultPatientId(data.matched_patient_id);
+        }
       } else {
         setChatHistory([...updatedHistory, { role: 'model', content: `Error: ${data.error || 'No response.'}` }]);
       }
@@ -519,11 +635,11 @@ export default function Home() {
   // UI Helpers
   const getEsiClass = (level: number) => {
     switch (level) {
-      case 1: return 'bg-red-500/10 border-red-500 text-red-400 shadow-[0_0_15px_rgba(239,68,68,0.15)] animate-pulse';
-      case 2: return 'bg-orange-500/10 border-orange-500 text-orange-400 shadow-[0_0_15px_rgba(245,158,11,0.1)]';
-      case 3: return 'bg-yellow-500/10 border-yellow-500 text-yellow-400';
-      case 4: return 'bg-emerald-500/10 border-emerald-500 text-emerald-400';
-      case 5: return 'bg-cyan-500/10 border-cyan-500 text-cyan-400';
+      case 1: return 'bg-red-500/10 border-red-500/30 text-red-500 shadow-[0_0_12px_rgba(239,68,68,0.1)] animate-pulse';
+      case 2: return 'bg-orange-500/10 border-orange-500/30 text-orange-500';
+      case 3: return 'bg-yellow-500/10 border-yellow-500/30 text-yellow-500';
+      case 4: return 'bg-emerald-500/10 border-emerald-500/30 text-emerald-500';
+      case 5: return 'bg-cyan-500/10 border-cyan-500/30 text-cyan-500';
       default: return 'bg-zinc-800 border-zinc-700 text-zinc-300';
     }
   };
@@ -534,280 +650,222 @@ export default function Home() {
   };
 
   return (
-    <div className={`flex-1 font-sans min-h-screen pb-12 antialiased selection:bg-cyan-500 selection:text-black transition-colors duration-200 ${
-      theme === 'light' ? 'light-theme bg-slate-50 text-slate-900' : 'bg-[#030712] text-zinc-100'
+    <div className={`flex min-h-screen bg-panel-bg text-text-primary transition-colors duration-300 ${
+      theme === 'light' ? 'light' : ''
     }`}>
       
-      {/* Keyframe Injection for custom scanlines, glows, and animations */}
-      <style jsx global>{`
-        @keyframes scan {
-          0% { transform: translateY(-100%); }
-          100% { transform: translateY(100%); }
-        }
-        .animate-scan {
-          animation: scan 6s linear infinite;
-        }
-        .shadow-glow-cyan {
-          box-shadow: 0 0 20px rgba(6, 182, 212, 0.2);
-        }
-        .shadow-glow-red {
-          box-shadow: 0 0 20px rgba(239, 68, 68, 0.25);
-        }
+      {/* 1. Left Collapsible Sidebar Panel */}
+      <aside className={`h-screen sticky top-0 border-r border-panel-border bg-panel-card backdrop-blur-xl flex flex-col justify-between p-4 transition-all duration-500 ease-in-out shrink-0 z-50 ${
+        sidebarExpanded ? 'w-64' : 'w-20'
+      }`}>
+        
+        {/* Top Section */}
+        <div className="flex flex-col gap-6">
+          {/* Logo & Expand Toggle Stack */}
+          <div className="flex flex-col gap-4 items-center w-full">
+            <div className="flex items-center justify-between w-full min-w-0">
+              <div className="flex items-center min-w-0">
+                <div className="w-10 h-10 rounded-xl bg-slate-900/10 border border-panel-border flex items-center justify-center shadow-sm overflow-hidden shrink-0">
+                  <img src="/vital_logo.png" alt="VITAL Logo" className="w-full h-full object-cover" />
+                </div>
+                <div className={`transition-all duration-500 ease-in-out overflow-hidden flex flex-col whitespace-nowrap ${
+                  sidebarExpanded ? 'max-w-[120px] opacity-100 ml-3' : 'max-w-0 opacity-0 ml-0'
+                }`}>
+                  <h1 className="text-base font-black tracking-tight text-text-primary leading-none">VITAL</h1>
+                  <span className="text-[8px] text-text-secondary uppercase tracking-widest font-black block mt-0.5">Intelligent Triage</span>
+                </div>
+              </div>
+              
+              {/* Theme toggle when expanded */}
+              {sidebarExpanded && (
+                <button
+                  onClick={() => setTheme(prev => prev === 'dark' ? 'light' : 'dark')}
+                  className="flex items-center justify-center p-2 bg-panel-bg border border-panel-border rounded-xl text-text-secondary hover:text-text-primary transition-all shadow-sm shrink-0"
+                  title={`Switch to ${theme === 'dark' ? 'Light' : 'Dark'} Mode`}
+                >
+                  {theme === 'dark' ? (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-amber-400">
+                      <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+                    </svg>
+                  ) : (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-accent-indigo">
+                      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+                    </svg>
+                  )}
+                </button>
+              )}
+            </div>
 
-        /* ── LIGHT THEME STYLES ── */
-        .light-theme {
-          background-color: #f8fafc !important;
-          color: #0f172a !important;
-        }
-        .light-theme header {
-          background-color: rgba(255, 255, 255, 0.9) !important;
-          border-color: #e2e8f0 !important;
-          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -2px rgba(0, 0, 0, 0.05) !important;
-        }
-        .light-theme header h1, .light-theme header span {
-          color: #0f172a !important;
-        }
-        .light-theme header p {
-          color: #64748b !important;
-        }
-        /* Top navigator */
-        .light-theme nav > div {
-          background-color: rgba(255, 255, 255, 0.95) !important;
-          border-color: #e2e8f0 !important;
-          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05) !important;
-        }
-        .light-theme nav button {
-          color: #64748b !important;
-        }
-        .light-theme nav button:hover {
-          background-color: #f1f5f9 !important;
-          color: #0f172a !important;
-        }
-        /* Cards */
-        .light-theme .bg-\[\#090e1e\]\/60,
-        .light-theme .bg-\[\#090e1e\]\/80 {
-          background-color: rgba(255, 255, 255, 0.9) !important;
-          border-color: #e2e8f0 !important;
-          box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -4px rgba(0, 0, 0, 0.05) !important;
-        }
-        /* Internal blocks (black backgrounds) */
-        .light-theme .bg-\[\#02040a\],
-        .light-theme .bg-\[\#02040a\]\/40,
-        .light-theme .bg-\[\#02040a\]\/60,
-        .light-theme .bg-\[\#02040a\]f0,
-        .light-theme .bg-\[\#070b19\] {
-          background-color: #f1f5f9 !important;
-          border-color: #e2e8f0 !important;
-        }
-        /* Border overrides */
-        .light-theme .border-zinc-800,
-        .light-theme .border-zinc-800\/80,
-        .light-theme .border-zinc-850,
-        .light-theme .border-zinc-800\/60,
-        .light-theme .border-zinc-700\/80,
-        .light-theme .border-indigo-800\/40 {
-          border-color: #e2e8f0 !important;
-        }
-        /* Text color overrides */
-        .light-theme .text-white,
-        .light-theme .text-zinc-100,
-        .light-theme .text-zinc-150,
-        .light-theme .text-zinc-200,
-        .light-theme .text-zinc-300 {
-          color: #0f172a !important;
-        }
-        .light-theme .text-zinc-450,
-        .light-theme .text-zinc-500,
-        .light-theme .text-zinc-550 {
-          color: #64748b !important;
-        }
-        .light-theme .text-zinc-400 {
-          color: #475569 !important;
-        }
-        /* Live Readings items styling */
-        .light-theme .bg-\[\#070b19\] {
-          background-color: #ffffff !important;
-          border-color: #e2e8f0 !important;
-        }
-        /* Forms, inputs & controls */
-        .light-theme select,
-        .light-theme input {
-          background-color: #ffffff !important;
-          border-color: #cbd5e1 !important;
-          color: #0f172a !important;
-        }
-        .light-theme select:focus,
-        .light-theme input:focus {
-          border-color: #06b6d4 !important;
-        }
-        /* Interactive controls panel bg */
-        .light-theme button.bg-zinc-900 {
-          background-color: #e2e8f0 !important;
-          color: #0f172a !important;
-          border-color: #cbd5e1 !important;
-        }
-        .light-theme button.bg-zinc-900:hover {
-          background-color: #cbd5e1 !important;
-        }
-        /* Scrollbars and status displays */
-        .light-theme .bg-\[\#0b1022\] {
-          background-color: #e2e8f0 !important;
-          border-color: #cbd5e1 !important;
-          color: #0f172a !important;
-        }
-        .light-theme .bg-\[\#0b1022\] .text-zinc-500 {
-          color: #475569 !important;
-        }
-        /* Chat view message bubbles */
-        .light-theme .bg-zinc-900\/60 {
-          background-color: #e2e8f0 !important;
-          color: #0f172a !important;
-          border-color: #cbd5e1 !important;
-        }
-        .light-theme .text-zinc-250 {
-          color: #1e293b !important;
-        }
-      `}</style>
-
-      {/* 1. Main Header */}
-      <header className="sticky top-0 z-50 bg-[#070b19]/90 backdrop-blur-xl border-b border-zinc-800/80 px-6 py-4 flex flex-wrap items-center justify-between gap-4 shadow-xl">
-        <div className="flex items-center gap-3">
-          <div className="w-12 h-12 rounded-xl bg-zinc-950 flex items-center justify-center shadow-lg shadow-cyan-500/20 relative overflow-hidden border border-zinc-800">
-            <img src="/vital_logo.png" alt="VITAL Logo" className="w-full h-full object-cover" />
+            {/* Theme toggle when collapsed (moves below logo) */}
+            {!sidebarExpanded && (
+              <button
+                onClick={() => setTheme(prev => prev === 'dark' ? 'light' : 'dark')}
+                className="flex items-center justify-center p-2 bg-panel-bg border border-panel-border rounded-xl text-text-secondary hover:text-text-primary transition-all shadow-sm w-10 h-10 shrink-0"
+                title={`Switch to ${theme === 'dark' ? 'Light' : 'Dark'} Mode`}
+              >
+                {theme === 'dark' ? (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-amber-400">
+                    <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+                  </svg>
+                ) : (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-accent-indigo">
+                    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+                  </svg>
+                )}
+              </button>
+            )}
           </div>
-          <div>
-            <h1 className="text-xl font-extrabold tracking-tight text-white flex items-center gap-2.5">
-              VITAL
-            </h1>
-            <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-bold mt-0.5">Vision-Based Intelligent Triage &amp; Autonomous Lifesign Analytics</p>
-          </div>
-        </div>
-
-        {/* Server status monitor */}
-        <div className="flex items-center gap-4">
-          {/* ARIA indicator */}
-          <div className="hidden md:flex items-center gap-2 text-xs bg-[#0b1022] border border-indigo-800/40 rounded-lg px-3 py-1.5">
-            <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse"></span>
-            <span className="text-indigo-400 font-black uppercase tracking-widest text-[10px]">ARIA ONLINE</span>
-          </div>
-          <div className="flex items-center gap-2 text-sm bg-[#0b1022] border border-zinc-800 rounded-lg px-4 py-2">
-            <span className="text-zinc-500 uppercase tracking-wider font-mono text-[10px] font-bold">System:</span>
-            {backendOnline ? (
-              <span className="flex items-center gap-1.5 font-extrabold text-emerald-400 text-xs">
-                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_8px_rgba(52,211,153,0.5)]"></span>
-                ONLINE
-              </span>
+          
+          {/* Collapse/Expand Sidebar Handle Button */}
+          <button
+            onClick={() => setSidebarExpanded(!sidebarExpanded)}
+            className="w-full flex items-center justify-center gap-2 py-2.5 px-3 bg-panel-bg border border-panel-border hover:border-text-secondary/20 rounded-xl text-[10px] font-black uppercase tracking-wider text-text-secondary hover:text-text-primary transition-all duration-300 shadow-sm shrink-0"
+            title={sidebarExpanded ? "Collapse Sidebar" : "Expand Sidebar"}
+          >
+            {sidebarExpanded ? (
+              <>
+                <span>◀</span>
+                <span>Collapse Menu</span>
+              </>
             ) : (
-              <span className="flex items-center gap-1.5 font-extrabold text-rose-500 text-xs">
-                <span className="w-2 h-2 rounded-full bg-rose-500"></span>
-                OFFLINE
-              </span>
+              <span>▶</span>
+            )}
+          </button>
+
+          {/* Navigation List */}
+          <nav className="flex flex-col gap-1.5 mt-2">
+            {[
+              { id: 'monitor', label: 'Vitals Monitor', icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> },
+              { id: 'queue', label: 'Triage Dispatch', icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>, count: triageQueue.length },
+              { id: 'crew', label: 'Clinical Crew', icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg> },
+              { id: 'chat', label: 'Clinical Consult', icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>, isAria: true }
+            ].map((item) => {
+              const isActive = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => setActiveTab(item.id as NavigationTab)}
+                  className={`w-full py-3 px-3.5 rounded-xl flex items-center transition-all duration-300 text-xs font-black uppercase tracking-wider relative ${
+                    isActive 
+                      ? 'bg-accent-cyan/10 text-accent-cyan border border-accent-cyan/20 shadow-[0_0_15px_var(--panel-border-glow)]'
+                      : 'text-text-secondary hover:text-text-primary border border-transparent hover:bg-panel-bg/40'
+                  }`}
+                  title={item.label}
+                >
+                  <div className="w-5 h-5 flex items-center justify-center shrink-0">
+                    {item.icon}
+                  </div>
+                  <span className={`transition-all duration-500 ease-in-out overflow-hidden whitespace-nowrap text-left font-black tracking-wider ${
+                    sidebarExpanded ? 'max-w-[150px] opacity-100 ml-3' : 'max-w-0 opacity-0 ml-0'
+                  }`}>
+                    {item.label}
+                  </span>
+                  
+                  {item.count !== undefined && item.count > 0 && (
+                    <span className={`absolute leading-none font-bold rounded-full transition-all duration-300 ${
+                      sidebarExpanded 
+                        ? 'right-3 px-1.5 py-0.5 text-[9px] bg-accent-cyan text-slate-950 font-black' 
+                        : 'top-1 right-1 w-4 h-4 text-[8px] bg-accent-cyan text-slate-950 flex items-center justify-center font-black'
+                    }`}>
+                      {item.count}
+                    </span>
+                  )}
+                  {item.isAria && !sidebarExpanded && (
+                    <span className="absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full bg-accent-cyan animate-pulse"></span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+
+        {/* Bottom Section */}
+        <div className="flex flex-col gap-4 border-t border-panel-border/40 pt-4 w-full">
+          {/* Active queue count summary */}
+          <div className="w-full">
+            <div className={`transition-all duration-500 ease-in-out overflow-hidden flex flex-col ${
+              sidebarExpanded ? 'max-h-[80px] opacity-100' : 'max-h-0 opacity-0 pointer-events-none'
+            }`}>
+              <div className="bg-panel-bg border border-panel-border rounded-xl p-3 shadow-sm text-center">
+                <div className="text-[8px] text-text-secondary uppercase tracking-widest font-black">Active Triage Cases</div>
+                <div className="text-sm font-black font-mono text-accent-cyan mt-0.5">{triageQueue.length} Active</div>
+              </div>
+            </div>
+            {!sidebarExpanded && (
+              <div className="flex justify-center transition-all duration-500" title={`${triageQueue.length} Patients in Queue`}>
+                <span className="w-8 h-8 rounded-full bg-panel-bg border border-panel-border flex items-center justify-center text-xs font-black text-accent-cyan shadow-sm font-mono">
+                  {triageQueue.length}
+                </span>
+              </div>
             )}
           </div>
-          <div className="w-px h-6 bg-zinc-800"></div>
-          <div className="text-xs bg-[#0b1022] border border-zinc-800 rounded-lg px-4 py-2 font-mono uppercase tracking-wider">
-            <span className="text-zinc-500">Queue</span>
-            <span className="font-black text-cyan-400 ml-2 text-sm">{triageQueue.length}</span>
+
+          {/* Telemetry Status Indicator */}
+          <div className="w-full">
+            <div className={`transition-all duration-500 ease-in-out overflow-hidden ${
+              sidebarExpanded ? 'max-h-[50px] opacity-100' : 'max-h-0 opacity-0 pointer-events-none'
+            }`}>
+              <div className="flex items-center justify-between text-[9px] font-black uppercase tracking-wider bg-panel-bg border border-panel-border rounded-xl p-3 shadow-sm">
+                <span className="text-text-secondary">System Online</span>
+                {backendOnline ? (
+                  <span className="flex items-center gap-1.5 text-emerald-500 font-extrabold">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.5)]"></span>
+                    LIVE
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1.5 text-rose-500 font-extrabold">
+                    <span className="w-2 h-2 rounded-full bg-rose-500"></span>
+                    OFFLINE
+                  </span>
+                )}
+              </div>
+            </div>
+            {!sidebarExpanded && (
+              <div className="flex justify-center transition-all duration-500 py-1" title={backendOnline ? "System Online: LIVE" : "System Offline"}>
+                <span className={`w-3.5 h-3.5 rounded-full flex items-center justify-center transition-all ${
+                  backendOnline 
+                    ? 'bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.5)]' 
+                    : 'bg-rose-500'
+                }`}></span>
+              </div>
+            )}
           </div>
-          <div className="w-px h-6 bg-zinc-800"></div>
-          {/* Theme Toggle Button */}
-          <button
-            onClick={() => setTheme(prev => prev === 'dark' ? 'light' : 'dark')}
-            className="flex items-center justify-center p-2 bg-[#0b1022] border border-zinc-800 rounded-lg hover:bg-zinc-800/50 hover:border-zinc-700 transition-colors"
-            title={`Switch to ${theme === 'dark' ? 'Light' : 'Dark'} Mode`}
-          >
-            {theme === 'dark' ? (
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-amber-400">
-                <circle cx="12" cy="12" r="5"/>
-                <line x1="12" y1="1" x2="12" y2="3"/>
-                <line x1="12" y1="21" x2="12" y2="23"/>
-                <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
-                <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
-                <line x1="1" y1="12" x2="3" y2="12"/>
-                <line x1="21" y1="12" x2="23" y2="12"/>
-                <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
-                <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
-              </svg>
-            ) : (
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-indigo-400">
-                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-              </svg>
-            )}
-          </button>
         </div>
-      </header>
+      </aside>
 
-      {/* 2. Top-Level Tab Navigator */}
-      <nav className="max-w-[1700px] mx-auto px-6 mt-5">
-        <div className="flex bg-[#090e1e]/80 border border-zinc-800/80 rounded-xl p-1 backdrop-blur-xl shadow-lg gap-1">
-          <button
-            onClick={() => setActiveTab('monitor')}
-            className={`flex-1 py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 transition-all text-xs font-black uppercase tracking-widest ${
-              activeTab === 'monitor' 
-                ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 shadow-glow-cyan' 
-                : 'text-zinc-500 hover:text-zinc-300 border border-transparent hover:bg-zinc-800/30'
-            }`}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-            Vitals Monitor
-          </button>
-          <button
-            onClick={() => setActiveTab('queue')}
-            className={`flex-1 py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 transition-all text-xs font-black uppercase tracking-widest ${
-              activeTab === 'queue' 
-                ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 shadow-glow-cyan' 
-                : 'text-zinc-500 hover:text-zinc-300 border border-transparent hover:bg-zinc-800/30'
-            }`}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
-            Triage Dispatch
-            {triageQueue.length > 0 && (
-              <span className="bg-cyan-500 text-[#020408] text-[9px] font-black px-1.5 py-0.5 rounded-full leading-none">{triageQueue.length}</span>
-            )}
-          </button>
-          <button
-            onClick={() => setActiveTab('crew')}
-            className={`flex-1 py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 transition-all text-xs font-black uppercase tracking-widest ${
-              activeTab === 'crew' 
-                ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 shadow-glow-cyan' 
-                : 'text-zinc-500 hover:text-zinc-300 border border-transparent hover:bg-zinc-800/30'
-            }`}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
-            Clinical Crew
-          </button>
-          <button
-            onClick={() => setActiveTab('chat')}
-            className={`flex-1 py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 transition-all text-xs font-black uppercase tracking-widest ${
-              activeTab === 'chat' 
-                ? 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 shadow-[0_0_15px_rgba(99,102,241,0.15)]' 
-                : 'text-zinc-500 hover:text-zinc-300 border border-transparent hover:bg-zinc-800/30'
-            }`}
-          >
-            <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse"></span>
-            ARIA Assistant
-          </button>
-        </div>
-      </nav>
-
-      {/* 3. Main Workspace Container */}
-      <main className="max-w-[1700px] mx-auto px-6 mt-6 pb-10">
+      {/* 2. Right-Side Workspace Container */}
+      <main className="flex-1 min-h-screen p-8 flex flex-col justify-between overflow-y-auto">
         
         {/* VIEW 1: LIVE VITAL MONITOR */}
         {activeTab === 'monitor' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
+          <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-stretch w-full flex-1">
             
-            {/* Left Hand side: Camera Feed Controls (expanded to col-span-7) */}
-            <div className="lg:col-span-7 flex flex-col gap-6">
-              <div className="bg-[#090e1e]/60 border border-zinc-800/80 rounded-2xl p-6 backdrop-blur-xl shadow-xl flex flex-col relative overflow-hidden">
-                <h2 className="text-xs font-black text-zinc-400 uppercase tracking-widest mb-4 flex items-center gap-2.5">
-                  <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-ping"></span>
-                  Intake Acquisition Feed
+            {/* Left Hand side: Camera Feed Controls (xl:col-span-7) */}
+            <div className="xl:col-span-7 flex flex-col gap-6">
+              <div className="bg-panel-card border border-panel-border rounded-3xl p-6 shadow-sm flex flex-col relative overflow-hidden flex-1 justify-between">
+                <h2 className="text-[10px] font-black text-text-secondary uppercase tracking-widest mb-4 flex items-center gap-2.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-accent-cyan animate-ping"></span>
+                  Intake Acquisition Viewport
                 </h2>
 
-                <div className="relative min-h-[420px] bg-[#02040a] border border-zinc-800 rounded-xl overflow-hidden mb-4 group flex items-center justify-center shadow-inner">
+                {/* Viewport Frame with HUD overlay (larger size utilization) */}
+                <div className="relative min-h-[480px] bg-slate-950/20 border border-panel-border rounded-2xl overflow-hidden mb-5 group flex items-center justify-center shadow-inner flex-1">
                   {backendOnline ? (
-                    metrics.status === 'IMAGE_READY' || metrics.remark === 'IMAGE_DEMO' ? (
+                    selectedCamera === -99 ? (
+                      browserAnnotatedFrame ? (
+                        <img 
+                          src={browserAnnotatedFrame} 
+                          alt="Local Browser Stream" 
+                          className="w-full h-full object-contain"
+                        />
+                      ) : (
+                        <div className="text-center p-6 text-text-secondary max-w-[340px]">
+                          <div className="text-4xl mb-4 opacity-75">📹</div>
+                          <p className="text-sm font-black text-text-primary uppercase tracking-wide">Browser Camera Ready</p>
+                          <p className="text-xs text-text-secondary mt-2 leading-relaxed font-semibold">Click "Init Sensors" to launch your client-side webcam feed.</p>
+                        </div>
+                      )
+                    ) : metrics.status === 'IMAGE_READY' || metrics.remark === 'IMAGE_DEMO' ? (
                       <img 
                         src={`${BACKEND_URL}/image_feed`} 
                         alt="Intake snap" 
@@ -820,41 +878,47 @@ export default function Home() {
                         alt="Medical Stream" 
                         className="w-full h-full object-contain"
                         onError={() => {
-                          // Auto-retry connection after 1s if stream breaks
                           setTimeout(() => setVideoFeedKey(k => k + 1), 1000);
                         }}
                       />
                     )
                   ) : (
-                    <div className="text-center p-6 text-zinc-500 max-w-[320px]">
-                      <div className="text-3xl mb-3">📡</div>
-                      <p className="text-sm font-bold text-zinc-300">Intake Hardware Offline</p>
-                      <p className="text-xs text-zinc-500 mt-2 leading-relaxed">Ensure Python backend API server is running on port 5002 with required dependencies.</p>
+                    <div className="text-center p-6 text-text-secondary max-w-[340px]">
+                      <div className="text-4xl mb-4 opacity-75">📡</div>
+                      <p className="text-sm font-black text-text-primary uppercase tracking-wide">Intake Hardware Offline</p>
+                      <p className="text-xs text-text-secondary mt-2 leading-relaxed font-semibold">Ensure Python backend API server is running on port 5002 with required dependencies.</p>
                     </div>
                   )}
 
-                  {/* Laser scan overlay */}
+                  {/* High-tech target corner brackets & sweeping line */}
                   {(metrics.status === 'CALIBRATING' || metrics.status === 'OK') && (
                     <div className="absolute inset-0 pointer-events-none overflow-hidden">
-                      <div className="w-full h-0.5 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_10px_#06b6d4] opacity-60 absolute animate-scan"></div>
+                      {/* Bounding bracket overlays */}
+                      <div className="absolute top-8 left-8 w-6 h-6 border-t-2 border-l-2 border-accent-cyan/60 rounded-tl-md"></div>
+                      <div className="absolute top-8 right-8 w-6 h-6 border-t-2 border-r-2 border-accent-cyan/60 rounded-tr-md"></div>
+                      <div className="absolute bottom-8 left-8 w-6 h-6 border-b-2 border-l-2 border-accent-cyan/60 rounded-bl-md"></div>
+                      <div className="absolute bottom-8 right-8 w-6 h-6 border-b-2 border-r-2 border-accent-cyan/60 rounded-br-md"></div>
+                      
+                      {/* Sweeping laser line */}
+                      <div className="w-full h-0.5 bg-gradient-to-r from-transparent via-accent-cyan to-transparent shadow-[0_0_10px_#06b6d4] opacity-50 absolute top-0 animate-[scan_6s_linear_infinite]"></div>
                     </div>
                   )}
 
                   {/* Floating acquisition state tags */}
                   <div className="absolute top-4 left-4 flex flex-wrap gap-2 pointer-events-none">
-                    <span className={`text-[10px] font-extrabold uppercase px-2.5 py-1 rounded-md border ${
-                      metrics.status === 'OK' ? 'bg-emerald-950/90 text-emerald-400 border-emerald-800/80 shadow-[0_0_10px_rgba(52,211,153,0.2)]' :
-                      metrics.status === 'CALIBRATING' ? 'bg-cyan-950/90 text-cyan-400 border-cyan-800/80 animate-pulse' :
-                      metrics.status === 'VIDEO_ENDED' ? 'bg-zinc-900/90 text-zinc-400 border-zinc-700/80' :
-                      metrics.status === 'IMAGE_READY' ? 'bg-purple-950/90 text-purple-400 border-purple-800/80' :
-                      'bg-zinc-950/90 text-zinc-500 border-zinc-800'
+                    <span className={`text-[9px] font-extrabold uppercase px-2.5 py-1 rounded-md border ${
+                      metrics.status === 'OK' ? 'bg-emerald-950/80 text-emerald-450 border-emerald-800/80 shadow-[0_0_10px_rgba(16,185,129,0.15)]' :
+                      metrics.status === 'CALIBRATING' ? 'bg-cyan-950/80 text-accent-cyan border-cyan-800/80 animate-pulse' :
+                      metrics.status === 'VIDEO_ENDED' ? 'bg-slate-900/80 text-text-secondary border-slate-700/80' :
+                      metrics.status === 'IMAGE_READY' ? 'bg-purple-950/80 text-purple-400 border-purple-800/80' :
+                      'bg-slate-950/80 text-text-secondary border-panel-border'
                     }`}>
                       {metrics.status}
                     </span>
                     
                     {metrics.face_detected && (
-                      <span className="text-[10px] bg-cyan-950/95 text-cyan-400 border border-cyan-800/80 px-2.5 py-1 rounded-md font-extrabold tracking-wider">
-                        TARGET DETECTED
+                      <span className="text-[9px] bg-cyan-950/80 text-accent-cyan border border-cyan-800/80 px-2.5 py-1 rounded-md font-extrabold tracking-wider">
+                        TARGET LOCKED
                       </span>
                     )}
                   </div>
@@ -862,48 +926,53 @@ export default function Home() {
 
                 {/* Controller section */}
                 <div className="flex flex-col gap-4">
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] text-zinc-450 font-black uppercase tracking-wider">Patient Identification (Full Name)</label>
+                  <div className="flex flex-col gap-2">
+                    <label className="text-[9px] text-text-secondary font-black uppercase tracking-wider">Patient Identification (Full Name)</label>
                     <input 
                       type="text" 
                       placeholder="Enter patient full name (e.g. John Doe)..." 
                       value={patientName}
                       onChange={(e) => setPatientName(e.target.value)}
-                      className="bg-[#02040a] border border-zinc-800 rounded-lg text-sm p-2.5 text-zinc-300 outline-none focus:border-cyan-500 transition-colors"
+                      className="bg-panel-bg border border-panel-border rounded-xl text-sm p-3.5 text-text-primary outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan/25 transition-all font-semibold shadow-sm"
                     />
                   </div>
 
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="flex flex-col gap-1.5">
-                      <label className="text-[10px] text-zinc-450 font-black uppercase tracking-wider">Optical Device</label>
-                      <select 
-                        value={selectedCamera !== null ? selectedCamera : ''}
-                        onChange={(e) => setSelectedCamera(Number(e.target.value))}
-                        className="bg-[#02040a] border border-zinc-800 rounded-lg text-sm p-2.5 text-zinc-300 outline-none focus:border-cyan-500 transition-colors cursor-pointer"
-                      >
-                        {cameras.map((cam) => (
-                          <option key={cam.index} value={cam.index}>{cam.label}</option>
-                        ))}
-                        {cameras.length === 0 && <option value="">No hardware found</option>}
-                      </select>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="flex flex-col gap-2">
+                      <label className="text-[9px] text-text-secondary font-black uppercase tracking-wider">Optical Device</label>
+                      <div className="relative">
+                        <select 
+                          value={selectedCamera !== null ? selectedCamera : ''}
+                          onChange={(e) => setSelectedCamera(Number(e.target.value))}
+                          className="w-full bg-panel-bg border border-panel-border rounded-xl text-sm p-3.5 text-text-primary outline-none focus:border-accent-cyan cursor-pointer appearance-none font-semibold shadow-sm"
+                        >
+                          {cameras.map((cam) => (
+                            <option key={cam.index} value={cam.index}>{cam.label}</option>
+                          ))}
+                          {cameras.length === 0 && <option value="">No hardware found</option>}
+                        </select>
+                        <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-text-secondary">
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+                        </div>
+                      </div>
                     </div>
 
-                    <div className="flex flex-col gap-1.5">
-                      <label className="text-[10px] text-zinc-450 font-black uppercase tracking-wider">Interface controls</label>
+                    <div className="flex flex-col gap-2">
+                      <label className="text-[9px] text-text-secondary font-black uppercase tracking-wider">Interface controls</label>
                       <div className="flex gap-2">
                         <button 
                           onClick={handleStartWebcam}
-                          className="flex-1 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/40 hover:border-cyan-500/60 font-bold text-xs py-2.5 px-3 rounded-lg transition-all shadow-glow-cyan"
+                          className="flex-1 bg-accent-cyan/10 hover:bg-accent-cyan/20 text-accent-cyan border border-accent-cyan/30 hover:border-accent-cyan/50 font-bold text-xs py-3 px-3 rounded-xl transition-all shadow-sm"
                         >
                           Init Sensors
                         </button>
                         <button 
                           onClick={metrics.is_live ? handleReleaseCamera : handleStartWebcam}
                           title={metrics.is_live ? "Release Hardware (Stop)" : "Initialize Hardware (Play)"}
-                          className={`px-4 py-2 border rounded-lg transition-colors flex items-center justify-center font-bold text-xs ${
+                          className={`px-4 py-3 border rounded-xl transition-all flex items-center justify-center font-bold text-xs shadow-sm ${
                             metrics.is_live 
-                              ? 'bg-rose-950/20 hover:bg-rose-900/20 border-rose-800/40 text-rose-400 shadow-[0_0_10px_rgba(244,63,94,0.1)]' 
-                              : 'bg-emerald-950/20 hover:bg-emerald-900/20 border-emerald-800/40 text-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.1)]'
+                              ? 'bg-rose-950/20 hover:bg-rose-900/20 border-rose-800/40 text-rose-450' 
+                              : 'bg-emerald-950/20 hover:bg-emerald-900/20 border-emerald-800/40 text-emerald-450'
                           }`}
                         >
                           {metrics.is_live ? '⏹' : '▶'}
@@ -912,66 +981,69 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] text-zinc-450 font-black uppercase tracking-wider">Upload Record (Video / Image)</label>
-                    <div className="relative border border-dashed border-zinc-850 hover:border-zinc-700 bg-[#02040a]/40 hover:bg-[#02040a]/75 rounded-lg p-4 text-center cursor-pointer transition-all">
+                  <div className="flex flex-col gap-2">
+                    <label className="text-[9px] text-text-secondary font-black uppercase tracking-wider">Upload Record (Video / Image)</label>
+                    <div className="relative border border-dashed border-panel-border hover:border-accent-cyan/50 bg-panel-bg/20 hover:bg-panel-bg/40 rounded-xl p-5 text-center cursor-pointer transition-all group">
                       <input 
                         type="file" 
                         accept="video/*,image/*" 
                         onChange={handleFileUpload}
                         className="absolute inset-0 opacity-0 cursor-pointer w-full h-full"
                       />
-                      <div className="text-zinc-300 text-sm font-semibold">
-                        📂 Choose patient media file...
+                      <svg xmlns="http://www.w3.org/2000/svg" className="mx-auto mb-2 text-text-secondary group-hover:text-accent-cyan transition-colors" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                      </svg>
+                      <div className="text-text-primary text-xs font-bold uppercase tracking-wide">
+                        📂 Drop patient media file...
                       </div>
-                      <p className="text-[9px] text-zinc-550 mt-1 uppercase tracking-wider font-mono">Supports MP4, webm, jpg, png</p>
+                      <p className="text-[9px] text-text-secondary mt-1 uppercase tracking-widest font-mono">Supports MP4, WebM, JPG, PNG</p>
                     </div>
                   </div>
 
                   {uploadMessage.text && (
-                    <div className={`text-xs p-3 rounded-md font-bold ${
-                      uploadMessage.type === 'success' ? 'bg-emerald-950/40 text-emerald-400 border border-emerald-900/30' : 'bg-rose-950/40 text-rose-400 border border-rose-900/30'
+                    <div className={`text-xs p-3 rounded-xl font-bold border ${
+                      uploadMessage.type === 'success' ? 'bg-emerald-950/30 text-emerald-400 border-emerald-900/40' : 'bg-rose-950/30 text-rose-450 border-rose-900/40'
                     }`}>
                       {uploadMessage.text}
                     </div>
                   )}
 
-                  {/* ── Signal Telemetry & Diagnostics ── unique hospital-grade widget */}
-                  <div className="mt-2 bg-[#02040a]/60 border border-zinc-800/60 rounded-xl p-4">
-                    <div className="text-[9px] text-zinc-500 font-black uppercase tracking-widest mb-3 flex items-center justify-between">
+                  {/* Signal Telemetry & Diagnostics */}
+                  <div className="mt-2 bg-panel-bg/30 border border-panel-border rounded-2xl p-4 shadow-sm">
+                    <div className="text-[9px] text-text-secondary font-black uppercase tracking-widest mb-3 flex items-center justify-between">
                       <div className="flex items-center gap-1.5">
-                        <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span>
+                        <span className="w-1.5 h-1.5 rounded-full bg-accent-cyan animate-pulse"></span>
                         Signal Telemetry &amp; Diagnostics
                       </div>
-                      <span className="font-mono text-[8px] text-zinc-650 bg-[#070b19] px-1.5 py-0.5 rounded border border-zinc-800">CHROM v2</span>
+                      <span className="font-mono text-[8px] text-text-muted bg-panel-bg px-2 py-0.5 rounded border border-panel-border font-bold">CHROM v2</span>
                     </div>
 
-                    <div className="space-y-2 font-mono text-[10px]">
-                      <div className="flex justify-between items-center py-1 border-b border-zinc-800/30">
-                        <span className="text-zinc-500 uppercase">Camera Status</span>
-                        <span className={`font-black uppercase ${metrics.is_live ? 'text-emerald-450' : 'text-zinc-600'}`}>
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-x-6 gap-y-2 font-mono text-[10px]">
+                      <div className="flex justify-between items-center py-1 border-b border-panel-border/30">
+                        <span className="text-text-secondary uppercase">Camera Status</span>
+                        <span className={`font-black uppercase ${metrics.is_live ? 'text-emerald-500' : 'text-text-muted'}`}>
                           {metrics.is_live ? 'ACTIVE (30 FPS)' : 'OFFLINE'}
                         </span>
                       </div>
-                      <div className="flex justify-between items-center py-1 border-b border-zinc-800/30">
-                        <span className="text-zinc-500 uppercase">Face ROI Lock</span>
-                        <span className={`font-black uppercase ${metrics.face_detected ? 'text-cyan-450' : 'text-zinc-600'}`}>
-                          {metrics.face_detected ? 'LOCKED (142x44px)' : 'NO LOCK'}
+                      <div className="flex justify-between items-center py-1 border-b border-panel-border/30">
+                        <span className="text-text-secondary uppercase">Face ROI Lock</span>
+                        <span className={`font-black uppercase ${metrics.face_detected ? 'text-accent-cyan' : 'text-text-muted'}`}>
+                          {metrics.face_detected ? 'LOCKED' : 'NO LOCK'}
                         </span>
                       </div>
-                      <div className="flex justify-between items-center py-1 border-b border-zinc-800/30">
-                        <span className="text-zinc-500 uppercase">Ambient Light</span>
-                        <span className={`font-black uppercase ${metrics.estimated_lux > 100 ? 'text-emerald-450' : 'text-amber-450'}`}>
-                          {metrics.estimated_lux} LUX ({metrics.estimated_lux > 100 ? 'OPTIMAL' : 'LOW'})
+                      <div className="flex justify-between items-center py-1 border-b border-panel-border/30">
+                        <span className="text-text-secondary uppercase">Ambient Light</span>
+                        <span className={`font-black uppercase ${metrics.estimated_lux > 100 ? 'text-emerald-500' : 'text-amber-500'}`}>
+                          {metrics.estimated_lux} LUX
                         </span>
                       </div>
-                      <div className="flex justify-between items-center py-1 border-b border-zinc-800/30">
-                        <span className="text-zinc-500 uppercase">Signal Stability</span>
-                        <span className="text-white font-black">{metrics.stability > 0 ? `${metrics.stability.toFixed(0)}%` : '--'}</span>
+                      <div className="flex justify-between items-center py-1 border-b border-panel-border/30">
+                        <span className="text-text-secondary uppercase">Stability</span>
+                        <span className="text-text-primary font-black">{metrics.stability > 0 ? `${metrics.stability.toFixed(0)}%` : '--'}</span>
                       </div>
-                      <div className="flex justify-between items-center py-1">
-                        <span className="text-zinc-500 uppercase">Noise Level (SNR)</span>
-                        <span className="text-indigo-400 font-black">{metrics.snr_db > 0 ? `${Number(metrics.snr_db).toFixed(1)} dB` : '--'}</span>
+                      <div className="flex justify-between items-center py-1 border-b border-panel-border/30">
+                        <span className="text-text-secondary uppercase">Noise (SNR)</span>
+                        <span className="text-accent-cyan font-black">{metrics.snr_db > 0 ? `${Number(metrics.snr_db).toFixed(1)} dB` : '--'}</span>
                       </div>
                     </div>
                   </div>
@@ -979,155 +1051,158 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Right Hand side: Vital Signs grid & PPG Plot (shrunk to col-span-5) */}
-            <div className="lg:col-span-5 flex flex-col gap-6">
+            {/* Right Hand side: Vital Signs grid & PPG Plot (xl:col-span-5) */}
+            <div className="xl:col-span-5 flex flex-col gap-6">
               
               {isTriageRunning && (
-                <div className="bg-[#090e1e]/80 border border-indigo-500/40 rounded-2xl p-5 backdrop-blur-xl shadow-xl flex items-center gap-4 animate-pulse">
-                  <div className="w-8 h-8 rounded-full border-2 border-indigo-400 border-t-transparent animate-spin shrink-0"></div>
+                <div className="bg-panel-card border border-panel-border rounded-2xl p-5 backdrop-blur-xl shadow-sm flex items-center gap-4 animate-pulse">
+                  <div className="w-6 h-6 rounded-full border-2 border-accent-cyan border-t-transparent animate-spin shrink-0"></div>
                   <div>
-                    <h3 className="text-xs font-black text-indigo-400 uppercase tracking-widest">Clinical Crew Running</h3>
-                    <p className="text-[10px] text-zinc-450 uppercase font-bold mt-1 leading-relaxed">
-                      3-Agent pipeline is executing diagnostics, ESI acuity check, and saving record to Neon.
+                    <h3 className="text-[10px] font-black text-text-primary uppercase tracking-widest">Clinical Crew Swarm Running</h3>
+                    <p className="text-[9px] text-text-secondary uppercase font-bold mt-1 leading-relaxed">
+                      3-Agent pipeline is executing diagnostics, ESI acuity check, and saving record.
                     </p>
                   </div>
                 </div>
               )}
               
-              {/* VITALS GRID */}
-              <div className="bg-[#090e1e]/60 border border-zinc-800/80 rounded-2xl p-6 backdrop-blur-xl shadow-xl">
+              {/* VITALS GRID (Expanded to flex-1 to fill the vertical space) */}
+              <div className="bg-panel-card border border-panel-border rounded-3xl p-6 shadow-sm flex flex-col justify-between flex-1 min-h-[380px]">
                 <div className="flex items-center justify-between mb-4">
-                  <h2 className="text-xs font-black text-zinc-400 uppercase tracking-widest flex items-center gap-2">
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
-                    Optical Physiology Indicators
+                  <h2 className="text-[10px] font-black text-text-secondary uppercase tracking-widest flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]"></span>
+                    Physiological Indicators
                   </h2>
-                  {/* 30-sec session acquisition timer */}
+                  
+                  {/* Acquisition countdown timer */}
                   <div className="flex items-center gap-2 ml-auto">
                     {metrics.calibration_done && sessionTimer > 0 && (
-                      <div className="flex items-center gap-2 bg-[#02040a] border border-cyan-800/40 rounded-lg px-3 py-1.5">
-                        <svg width="28" height="28" viewBox="0 0 36 36" className="-rotate-90">
-                          <circle cx="18" cy="18" r="14" fill="none" stroke="rgba(6,182,212,0.15)" strokeWidth="3"/>
-                          <circle cx="18" cy="18" r="14" fill="none" stroke="#06b6d4" strokeWidth="3"
+                      <div className="flex items-center gap-2 bg-panel-bg border border-panel-border rounded-lg px-2.5 py-1 shadow-sm">
+                        <svg width="24" height="24" viewBox="0 0 36 36" className="-rotate-90">
+                          <circle cx="18" cy="18" r="14" fill="none" stroke="rgba(56,189,248,0.1)" strokeWidth="3"/>
+                          <circle cx="18" cy="18" r="14" fill="none" stroke="#38bdf8" strokeWidth="3"
                             strokeDasharray={`${2 * Math.PI * 14}`}
                             strokeDashoffset={`${2 * Math.PI * 14 * (1 - sessionTimer / 30)}`}
                             strokeLinecap="round" style={{transition: 'stroke-dashoffset 1s linear'}}/>
-                          <text x="18" y="23" textAnchor="middle" fill="#06b6d4" fontSize="10" fontWeight="900"
+                          <text x="18" y="23" textAnchor="middle" fill="var(--text-primary)" fontSize="10" fontWeight="900"
                             style={{transform: 'rotate(90deg)', transformOrigin: '18px 18px'}}>{sessionTimer}</text>
                         </svg>
                         <div className="text-right">
-                          <div className="text-[9px] text-zinc-500 font-black uppercase tracking-widest">Scan Window</div>
-                          <div className="text-[11px] text-cyan-400 font-black">{sessionTimer}s remaining</div>
+                          <div className="text-[8px] text-text-secondary font-black uppercase tracking-widest leading-none">Acquisition</div>
+                          <div className="text-[10px] text-accent-cyan font-black mt-0.5 leading-none">{sessionTimer}s left</div>
                         </div>
                       </div>
                     )}
                     {sessionTimer === 0 && !reportLoading && sessionReport && (
-                      <div className="text-[10px] bg-emerald-950/60 border border-emerald-800/50 text-emerald-400 px-3 py-1.5 rounded-lg font-black uppercase tracking-widest flex items-center gap-1.5">
+                      <div className="text-[9px] bg-emerald-950/60 border border-emerald-800/50 text-emerald-400 px-3 py-1 rounded-lg font-black uppercase tracking-widest flex items-center gap-1.5 shadow-sm">
                         <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
                         Report Ready
                       </div>
                     )}
                     {reportLoading && (
-                      <div className="text-[10px] text-cyan-400 font-black uppercase tracking-widest flex items-center gap-1.5 animate-pulse">
-                        <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping"></span>
-                        Compiling Report...
+                      <div className="text-[9px] text-accent-cyan font-black uppercase tracking-widest flex items-center gap-1.5 animate-pulse">
+                        <span className="w-1.5 h-1.5 rounded-full bg-accent-cyan animate-ping"></span>
+                        Analyzing Buffer...
                       </div>
                     )}
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {/* Vertical-flexing cards for Physiological readings: Made taller & lengthier */}
+                <div className="flex flex-col gap-4 flex-1">
                   
                   {/* HEART RATE */}
-                  <div className={`bg-[#02040a]/50 border rounded-xl p-5 flex flex-col justify-between hover:border-zinc-700 transition-all ${
-                    metrics.classification === 'TACHYCARDIA' ? 'border-rose-500/40 bg-rose-950/5 shadow-glow-red' :
+                  <div className={`bg-panel-bg/30 border rounded-2xl p-6 flex flex-col justify-between hover:border-text-secondary/20 transition-all duration-300 flex-1 min-h-[120px] ${
+                    metrics.classification === 'TACHYCARDIA' ? 'border-rose-500/40 bg-rose-500/5 shadow-[0_0_15px_rgba(239,68,68,0.05)]' :
                     metrics.classification === 'NORMAL' ? 'border-emerald-500/20' :
-                    'border-zinc-800'
+                    'border-panel-border'
                   }`}>
                     <div className="flex items-center justify-between">
-                      <span className="text-[10px] text-zinc-400 font-extrabold uppercase tracking-wider">Heart Rate</span>
-                      <span 
-                        className="text-sm text-rose-500 transition-all transform origin-center animate-ping"
-                        style={{ animationDuration: getHeartbeatDuration() }}
-                      >
-                        ❤️
-                      </span>
+                      <span className="text-[9px] text-text-secondary font-extrabold uppercase tracking-wider">Heart Rate</span>
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="w-4 h-4 text-rose-500 animate-heart-pulse">
+                        <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z" />
+                      </svg>
                     </div>
-                    <div className="my-3 flex items-baseline gap-2">
-                      <span className="text-5xl font-black text-white tracking-tight leading-none font-mono">
+                    <div className="my-2 flex items-baseline gap-2">
+                      <span className="text-5xl font-black text-text-primary tracking-tight leading-none font-mono">
                         {metrics.bpm > 0 ? metrics.bpm : '--'}
                       </span>
-                      <span className="text-[11px] text-zinc-500 font-bold uppercase tracking-wider">BPM</span>
+                      <span className="text-[10px] text-text-secondary font-bold uppercase tracking-wider">BPM</span>
                     </div>
-                    <div className="flex items-center justify-between border-t border-zinc-850 pt-2">
-                      <span className={`text-[10px] px-2 py-0.5 rounded font-extrabold uppercase tracking-widest ${
-                        metrics.classification === 'NORMAL' ? 'bg-emerald-950/80 text-emerald-450 border border-emerald-900/60' :
-                        metrics.classification === 'TACHYCARDIA' ? 'bg-rose-950/80 text-rose-450 border border-rose-900/60 shadow-glow-red' :
-                        metrics.classification === 'BRADYCARDIA' ? 'bg-cyan-950/80 text-cyan-450 border border-cyan-900/60' :
-                        'bg-zinc-900 text-zinc-500'
+                    <div className="flex items-center justify-between border-t border-panel-border/30 pt-2">
+                      <span className={`text-[9px] px-2 py-0.5 rounded font-extrabold uppercase tracking-widest ${
+                        metrics.classification === 'NORMAL' ? 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/20' :
+                        metrics.classification === 'TACHYCARDIA' ? 'bg-rose-500/10 text-rose-500 border border-rose-500/20' :
+                        metrics.classification === 'BRADYCARDIA' ? 'bg-cyan-500/10 text-cyan-500 border border-cyan-500/20' :
+                        'bg-panel-bg text-text-secondary'
                       }`}>
                         {metrics.classification}
                       </span>
-                      <span className="text-[10px] text-zinc-500 font-mono">Conf: {typeof metrics.confidence === 'number' ? metrics.confidence.toFixed(1) : metrics.confidence}%</span>
+                      <span className="text-[9px] text-text-secondary font-mono">Conf: {typeof metrics.confidence === 'number' ? metrics.confidence.toFixed(0) : metrics.confidence}%</span>
                     </div>
                   </div>
 
                   {/* RESPIRATORY RATE */}
-                  <div className={`bg-[#02040a]/50 border rounded-xl p-5 flex flex-col justify-between hover:border-zinc-700 transition-all ${
-                    metrics.rr_classification === 'TACHYPNEA' ? 'border-rose-500/40 bg-rose-950/5' :
+                  <div className={`bg-panel-bg/30 border rounded-2xl p-6 flex flex-col justify-between hover:border-text-secondary/20 transition-all duration-300 flex-1 min-h-[120px] ${
+                    metrics.rr_classification === 'TACHYPNEA' ? 'border-rose-500/40 bg-rose-500/5' :
                     metrics.rr_classification === 'NORMAL' ? 'border-emerald-500/20' :
-                    'border-zinc-800'
+                    'border-panel-border'
                   }`}>
                     <div className="flex items-center justify-between">
-                      <span className="text-[10px] text-zinc-400 font-extrabold uppercase tracking-wider">Respiration</span>
-                      <span className="text-sm text-cyan-450 animate-pulse">🌬️</span>
+                      <span className="text-[9px] text-text-secondary font-extrabold uppercase tracking-wider">Respiration</span>
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="w-4 h-4 text-cyan-500">
+                        <path d="M2 12h3c.7 0 1.2-.6 1.4-1.2l1.2-3.6c.3-.9 1.6-.9 1.9 0l2 6c.3.9 1.6.9 1.9 0l1.2-3.6c.2-.6.7-1.2 1.4-1.2h6" />
+                      </svg>
                     </div>
-                    <div className="my-3 flex items-baseline gap-2 overflow-hidden">
-                      <span className="text-5xl font-black text-white tracking-tight leading-none font-mono truncate">
+                    <div className="my-2 flex items-baseline gap-1.5 overflow-hidden">
+                      <span className="text-5xl font-black text-text-primary tracking-tight leading-none font-mono truncate">
                         {metrics.rr > 0 ? Number(metrics.rr).toFixed(1) : '--'}
                       </span>
-                      <span className="text-[11px] text-zinc-500 font-bold uppercase tracking-wider shrink-0">B/min</span>
+                      <span className="text-[10px] text-text-secondary font-bold uppercase tracking-wider shrink-0">B/min</span>
                     </div>
-                    <div className="flex items-center justify-between border-t border-zinc-850 pt-2">
-                      <span className={`text-[10px] px-2 py-0.5 rounded font-extrabold uppercase tracking-widest ${
-                        metrics.rr_classification === 'NORMAL' ? 'bg-emerald-950/80 text-emerald-450 border border-emerald-900/60' :
-                        metrics.rr_classification === 'TACHYPNEA' ? 'bg-rose-950/80 text-rose-450 border border-rose-900/60' :
-                        metrics.rr_classification === 'BRADYPNEA' ? 'bg-cyan-950/80 text-cyan-450 border border-cyan-900/60' :
-                        'bg-zinc-900 text-zinc-500'
+                    <div className="flex items-center justify-between border-t border-panel-border/30 pt-2">
+                      <span className={`text-[9px] px-2 py-0.5 rounded font-extrabold uppercase tracking-widest ${
+                        metrics.rr_classification === 'NORMAL' ? 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/20' :
+                        metrics.rr_classification === 'TACHYPNEA' ? 'bg-rose-500/10 text-rose-500 border border-rose-500/20' :
+                        metrics.rr_classification === 'BRADYPNEA' ? 'bg-cyan-500/10 text-cyan-500 border border-cyan-500/20' :
+                        'bg-panel-bg text-text-secondary'
                       }`}>
                         {metrics.rr_classification}
                       </span>
-                      <span className="text-[10px] text-zinc-500 font-mono">Conf: {typeof metrics.rr_confidence === 'number' ? Number(metrics.rr_confidence).toFixed(1) : metrics.rr_confidence}%</span>
+                      <span className="text-[9px] text-text-secondary font-mono">Conf: {typeof metrics.rr_confidence === 'number' ? Number(metrics.rr_confidence).toFixed(0) : metrics.rr_confidence}%</span>
                     </div>
                   </div>
 
                   {/* STRESS INDEX */}
-                  <div className={`bg-[#02040a]/50 border rounded-xl p-5 flex flex-col justify-between hover:border-zinc-700 transition-all ${
-                    metrics.stress_index > 150 ? 'border-rose-500/40 bg-rose-950/5' :
-                    metrics.stress_index > 80 ? 'border-amber-500/30 bg-amber-950/5' :
-                    'border-zinc-800'
+                  <div className={`bg-panel-bg/30 border rounded-2xl p-6 flex flex-col justify-between hover:border-text-secondary/20 transition-all duration-300 flex-1 min-h-[120px] ${
+                    metrics.stress_index > 150 ? 'border-rose-500/40 bg-rose-500/5' :
+                    metrics.stress_index > 80 ? 'border-amber-500/30 bg-amber-500/5' :
+                    'border-panel-border'
                   }`}>
                     <div className="flex items-center justify-between">
-                      <span className="text-[10px] text-zinc-400 font-extrabold uppercase tracking-wider">Stress Index</span>
-                      <span className="text-sm text-yellow-500">⚡</span>
+                      <span className="text-[9px] text-text-secondary font-extrabold uppercase tracking-wider">Stress Index</span>
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="w-4 h-4 text-amber-500">
+                        <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+                      </svg>
                     </div>
-                    <div className="my-3 flex items-baseline gap-2 overflow-hidden">
-                      <span className={`font-black text-white tracking-tight leading-none font-mono ${
+                    <div className="my-2 flex items-baseline gap-1.5 overflow-hidden">
+                      <span className={`font-black text-text-primary tracking-tight leading-none font-mono ${
                         metrics.stress_index > 999 ? 'text-3xl' : 'text-5xl'
                       }`}>
                         {metrics.stress_index > 0 ? Number(metrics.stress_index).toFixed(0) : '--'}
                       </span>
-                      <span className="text-[11px] text-zinc-500 font-bold uppercase tracking-wider shrink-0">INDEX</span>
+                      <span className="text-[10px] text-text-secondary font-bold uppercase tracking-wider shrink-0">IDX</span>
                     </div>
-                    <div className="flex items-center justify-between border-t border-zinc-850 pt-2">
-                      <span className={`text-[10px] px-2 py-0.5 rounded font-extrabold uppercase tracking-widest ${
-                        metrics.stress_index > 150 ? 'bg-rose-950/80 text-rose-450' :
-                        metrics.stress_index > 80 ? 'bg-amber-950/80 text-amber-450' :
-                        metrics.stress_index > 0 ? 'bg-emerald-950/80 text-emerald-450' :
-                        'bg-zinc-900 text-zinc-500'
+                    <div className="flex items-center justify-between border-t border-panel-border/30 pt-2">
+                      <span className={`text-[9px] px-2 py-0.5 rounded font-extrabold uppercase tracking-widest ${
+                        metrics.stress_index > 150 ? 'bg-rose-500/10 text-rose-500' :
+                        metrics.stress_index > 80 ? 'bg-amber-500/10 text-amber-450' :
+                        metrics.stress_index > 0 ? 'bg-emerald-500/10 text-emerald-500' :
+                        'bg-panel-bg text-text-secondary'
                       }`}>
                         {metrics.stress_index > 150 ? 'CRITICAL' : metrics.stress_index > 80 ? 'ELEVATED' : metrics.stress_index > 0 ? 'OPTIMAL' : '--'}
                       </span>
-                      <span className="text-[10px] text-zinc-500 font-mono">HRV: {typeof metrics.hrv === 'number' ? Number(metrics.hrv).toFixed(0) : '--'}ms</span>
+                      <span className="text-[9px] text-text-secondary font-mono">HRV: {typeof metrics.hrv === 'number' ? Number(metrics.hrv).toFixed(0) : '--'}ms</span>
                     </div>
                   </div>
 
@@ -1135,27 +1210,27 @@ export default function Home() {
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
                   {/* SIGNAL QUALITY & SNR */}
-                  <div className="bg-[#02040a]/50 border border-zinc-800 rounded-xl p-4 flex items-center justify-between hover:border-zinc-700 transition-all">
+                  <div className="bg-panel-bg/20 border border-panel-border rounded-xl p-4 flex items-center justify-between hover:border-text-secondary/20 transition-all">
                     <div>
-                      <span className="text-[10px] text-zinc-500 font-extrabold uppercase tracking-wider">Signal SNR</span>
-                      <div className="text-2xl font-black text-white font-mono mt-1">{metrics.snr_db ? `${metrics.snr_db.toFixed(1)} dB` : '--'}</div>
+                      <span className="text-[9px] text-text-secondary font-extrabold uppercase tracking-wider">Signal SNR</span>
+                      <div className="text-xl font-black text-text-primary font-mono mt-1">{metrics.snr_db ? `${metrics.snr_db.toFixed(1)} dB` : '--'}</div>
                     </div>
                     <div className="text-right">
-                      <span className="text-[10px] text-zinc-500 font-extrabold uppercase tracking-wider">Stability</span>
-                      <div className="text-sm font-bold text-cyan-400 font-mono mt-1">{metrics.stability_indicator} ({metrics.stability.toFixed(1)} bpm)</div>
+                      <span className="text-[9px] text-text-secondary font-extrabold uppercase tracking-wider">Stability</span>
+                      <div className="text-xs font-bold text-accent-cyan font-mono mt-1">{metrics.stability_indicator} ({metrics.stability.toFixed(1)} bpm)</div>
                     </div>
                   </div>
 
                   {/* LIGHT & MOTION */}
-                  <div className="bg-[#02040a]/50 border border-zinc-800 rounded-xl p-4 flex items-center justify-between hover:border-zinc-700 transition-all">
+                  <div className="bg-panel-bg/20 border border-panel-border rounded-xl p-4 flex items-center justify-between hover:border-text-secondary/20 transition-all">
                     <div>
-                      <span className="text-[10px] text-zinc-500 font-extrabold uppercase tracking-wider">Acquisition Environment</span>
-                      <div className="text-sm font-extrabold text-zinc-300 mt-1 flex flex-col gap-0.5">
-                        <span>Luminance: <strong className="text-white font-mono">{metrics.estimated_lux} LUX</strong></span>
-                        <span>Motion: <strong className="text-white font-mono">{metrics.motion_delta.toFixed(1)}</strong></span>
+                      <span className="text-[9px] text-text-secondary font-extrabold uppercase tracking-wider">Environment</span>
+                      <div className="text-xs font-extrabold text-text-secondary mt-1 flex flex-col gap-0.5">
+                        <span>Luminance: <strong className="text-text-primary font-mono">{metrics.estimated_lux} LUX</strong></span>
+                        <span>Motion: <strong className="text-text-primary font-mono">{metrics.motion_delta.toFixed(1)}</strong></span>
                       </div>
                     </div>
-                    <div className="text-[10px] text-zinc-550 text-right leading-relaxed font-semibold">
+                    <div className="text-[9px] text-text-secondary text-right leading-relaxed font-semibold">
                       <div>LIMIT: &gt;100 LUX</div>
                       <div>MOTION: &lt;15.0</div>
                     </div>
@@ -1163,11 +1238,11 @@ export default function Home() {
                 </div>
 
                 {metrics.warnings && metrics.warnings.length > 0 && (
-                  <div className="mt-4 p-4 bg-rose-950/20 border border-rose-900/40 rounded-xl flex flex-col gap-1.5 shadow-glow-red animate-pulse">
-                    <div className="text-xs font-black text-rose-400 uppercase tracking-wider flex items-center gap-1.5">
-                      ⚠ Telemetry acquisition warnings:
+                  <div className="mt-4 p-4 bg-rose-500/5 border border-rose-500/20 rounded-xl flex flex-col gap-1.5 shadow-[0_0_15px_rgba(239,68,68,0.03)] animate-pulse">
+                    <div className="text-xs font-black text-rose-500 uppercase tracking-wider flex items-center gap-1.5">
+                      ⚠️ Sensor telemetry alerts:
                     </div>
-                    <ul className="list-disc list-inside text-xs text-rose-300 font-semibold leading-relaxed">
+                    <ul className="list-disc list-inside text-xs text-rose-400 font-semibold leading-relaxed">
                       {metrics.warnings.map((w, idx) => <li key={idx}>{w}</li>)}
                     </ul>
                   </div>
@@ -1176,105 +1251,104 @@ export default function Home() {
 
               {/* 30-SECOND SESSION REPORT */}
               {sessionReport && (
-                <div className="bg-[#090e1e]/80 border border-emerald-800/40 rounded-2xl p-5 backdrop-blur-xl shadow-xl animate-in fade-in duration-500">
+                <div className="bg-panel-card border border-emerald-500/20 rounded-3xl p-5 backdrop-blur-xl shadow-sm animate-in fade-in duration-500">
                   <div className="flex items-center justify-between mb-4">
                     <div className="flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                      <h3 className="text-xs font-black text-emerald-400 uppercase tracking-widest">30-Second Clinical Session Report</h3>
+                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]"></span>
+                      <h3 className="text-[10px] font-black text-emerald-500 uppercase tracking-widest">30s Intake Session Telemetry</h3>
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="text-[9px] text-zinc-500 font-mono uppercase">{sessionReport.generated_at}</span>
+                      <span className="text-[8px] text-text-secondary font-mono font-bold uppercase">{sessionReport.generated_at}</span>
                       <button onClick={() => { setSessionReport(null); setSessionTimer(30); reportFetchedRef.current = false; }}
-                        className="text-zinc-600 hover:text-zinc-400 text-xs px-2 py-0.5 rounded border border-zinc-800 hover:border-zinc-700 transition-colors font-mono">
+                        className="text-text-secondary hover:text-text-primary text-xs px-2 py-0.5 rounded border border-panel-border transition-colors font-mono">
                         ✕
                       </button>
                     </div>
                   </div>
 
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-                    <div className="bg-[#02040a] border border-zinc-800 rounded-xl p-3 text-center">
-                      <div className="text-[9px] text-zinc-500 uppercase tracking-widest font-bold mb-1">Avg BPM</div>
-                      <div className="text-2xl font-black font-mono text-white">{sessionReport.vitals.heart_rate_avg ?? '--'}</div>
-                      <div className={`text-[9px] mt-1 font-black uppercase tracking-widest ${
-                        sessionReport.vitals.classification === 'NORMAL' ? 'text-emerald-400' :
-                        sessionReport.vitals.classification === 'TACHYCARDIA' ? 'text-rose-400' : 'text-cyan-400'
+                    <div className="bg-panel-bg border border-panel-border rounded-xl p-3 text-center">
+                      <div className="text-[8px] text-text-secondary uppercase tracking-widest font-black mb-1">Avg BPM</div>
+                      <div className="text-xl font-black font-mono text-text-primary">{sessionReport.vitals.heart_rate_avg ?? '--'}</div>
+                      <div className={`text-[8px] mt-1 font-black uppercase tracking-widest ${
+                        sessionReport.vitals.classification === 'NORMAL' ? 'text-emerald-500' :
+                        sessionReport.vitals.classification === 'TACHYCARDIA' ? 'text-rose-500' : 'text-accent-cyan'
                       }`}>{sessionReport.vitals.classification}</div>
                     </div>
-                    <div className="bg-[#02040a] border border-zinc-800 rounded-xl p-3 text-center">
-                      <div className="text-[9px] text-zinc-500 uppercase tracking-widest font-bold mb-1">Respiration</div>
-                      <div className="text-2xl font-black font-mono text-white">{sessionReport.vitals.respiratory_rate ?? '--'}</div>
-                      <div className="text-[9px] mt-1 font-black uppercase tracking-widest text-cyan-400">{sessionReport.vitals.rr_classification}</div>
+                    <div className="bg-panel-bg border border-panel-border rounded-xl p-3 text-center">
+                      <div className="text-[8px] text-text-secondary uppercase tracking-widest font-black mb-1">Respiration</div>
+                      <div className="text-xl font-black font-mono text-text-primary">{sessionReport.vitals.respiratory_rate ?? '--'}</div>
+                      <div className="text-[8px] mt-1 font-black uppercase tracking-widest text-accent-cyan">{sessionReport.vitals.rr_classification}</div>
                     </div>
-                    <div className="bg-[#02040a] border border-zinc-800 rounded-xl p-3 text-center">
-                      <div className="text-[9px] text-zinc-500 uppercase tracking-widest font-bold mb-1">HRV (RMSSD)</div>
-                      <div className="text-2xl font-black font-mono text-indigo-400">{sessionReport.vitals.hrv_rmssd_ms ?? '--'}</div>
-                      <div className="text-[9px] mt-1 font-bold text-zinc-500 uppercase">ms</div>
+                    <div className="bg-panel-bg border border-panel-border rounded-xl p-3 text-center">
+                      <div className="text-[8px] text-text-secondary uppercase tracking-widest font-black mb-1">HRV (RMSSD)</div>
+                      <div className="text-xl font-black font-mono text-accent-indigo">{sessionReport.vitals.hrv_rmssd_ms ?? '--'}</div>
+                      <div className="text-[8px] mt-1 font-bold text-text-secondary uppercase">ms</div>
                     </div>
-                    <div className="bg-[#02040a] border border-zinc-800 rounded-xl p-3 text-center">
-                      <div className="text-[9px] text-zinc-500 uppercase tracking-widest font-bold mb-1">Stress</div>
-                      <div className={`text-2xl font-black font-mono ${
-                        sessionReport.vitals.stress_label === 'CRITICAL' ? 'text-rose-400' :
-                        sessionReport.vitals.stress_label === 'ELEVATED' ? 'text-amber-400' : 'text-emerald-400'
+                    <div className="bg-panel-bg border border-panel-border rounded-xl p-3 text-center">
+                      <div className="text-[8px] text-text-secondary uppercase tracking-widest font-black mb-1">Stress</div>
+                      <div className={`text-xl font-black font-mono ${
+                        sessionReport.vitals.stress_label === 'CRITICAL' ? 'text-rose-500' :
+                        sessionReport.vitals.stress_label === 'ELEVATED' ? 'text-amber-500' : 'text-emerald-500'
                       }`}>{sessionReport.vitals.stress_index ?? '--'}</div>
-                      <div className={`text-[9px] mt-1 font-black uppercase tracking-widest ${
-                        sessionReport.vitals.stress_label === 'CRITICAL' ? 'text-rose-400' :
-                        sessionReport.vitals.stress_label === 'ELEVATED' ? 'text-amber-400' : 'text-emerald-400'
+                      <div className={`text-[8px] mt-1 font-black uppercase tracking-widest ${
+                        sessionReport.vitals.stress_label === 'CRITICAL' ? 'text-rose-500' :
+                        sessionReport.vitals.stress_label === 'ELEVATED' ? 'text-amber-500' : 'text-emerald-500'
                       }`}>{sessionReport.vitals.stress_label}</div>
                     </div>
                   </div>
 
-                  <div className="bg-[#02040a]/80 border border-zinc-800/60 rounded-xl p-4 mb-3">
-                    <div className="text-[9px] text-zinc-500 font-black uppercase tracking-widest mb-2">Clinical Interpretation</div>
-                    <p className="text-sm text-zinc-300 leading-relaxed font-semibold">{sessionReport.clinical_summary}</p>
+                  <div className="bg-panel-bg/60 border border-panel-border/70 rounded-xl p-4 mb-3">
+                    <div className="text-[8px] text-text-secondary font-black uppercase tracking-widest mb-1.5">Interpretation Analysis</div>
+                    <p className="text-xs text-text-primary leading-relaxed font-semibold">{sessionReport.clinical_summary}</p>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-4 text-[9px] text-zinc-600 font-bold uppercase tracking-wider">
-                    <span>Confidence: <strong className="text-zinc-400">{sessionReport.signal_quality.confidence_pct}%</strong></span>
-                    <span>SNR: <strong className="text-zinc-400">{sessionReport.signal_quality.snr_db ?? '--'} dB</strong></span>
-                    <span>Stability: <strong className="text-zinc-400">{sessionReport.signal_quality.stability}</strong></span>
-                    <span>Lux: <strong className="text-zinc-400">{sessionReport.signal_quality.luminance_lux}</strong></span>
-                    <span className="text-zinc-700">· {sessionReport.disclaimer}</span>
+                  <div className="flex flex-wrap items-center gap-3 text-[8px] text-text-secondary font-bold uppercase tracking-wider">
+                    <span>Conf: <strong className="text-text-primary">{sessionReport.signal_quality.confidence_pct}%</strong></span>
+                    <span>SNR: <strong className="text-text-primary">{sessionReport.signal_quality.snr_db ?? '--'} dB</strong></span>
+                    <span>Stability: <strong className="text-text-primary">{sessionReport.signal_quality.stability}</strong></span>
+                    <span>Lux: <strong className="text-text-primary">{sessionReport.signal_quality.luminance_lux}</strong></span>
+                    <span className="opacity-50">· {sessionReport.disclaimer}</span>
                   </div>
                 </div>
               )}
 
               {/* RPPG CANVAS GRAPH */}
-
-              <div className="bg-[#090e1e]/60 border border-zinc-800/80 rounded-2xl p-6 backdrop-blur-xl shadow-xl flex-1 flex flex-col relative overflow-hidden">
-                <div className="flex items-center justify-between mb-3">
-                  <h2 className="text-xs font-black text-zinc-400 uppercase tracking-widest flex items-center gap-2">
-                    <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse shadow-glow-cyan"></span>
-                    rPPG Photonic Waveform analysis
+              <div className="bg-panel-card border border-panel-border rounded-3xl p-6 shadow-sm flex flex-col relative overflow-hidden justify-between h-[280px] shrink-0">
+                <div className="flex items-center justify-between mb-2">
+                  <h2 className="text-[10px] font-black text-text-secondary uppercase tracking-widest flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-accent-cyan animate-pulse"></span>
+                    rPPG Photonic Waveform Analysis
                   </h2>
-                  <span className="text-xs text-zinc-500 font-mono tracking-widest uppercase">
+                  <span className="text-[9px] text-text-secondary font-mono tracking-widest uppercase font-bold">
                     {metrics.sqi > 0 ? `SQI: ${metrics.sqi}%` : 'Calibrating signals...'}
                   </span>
                 </div>
                 
-                <div className="relative bg-[#02040a] border border-zinc-800 rounded-xl p-2 flex items-center justify-center overflow-hidden flex-1 min-h-[220px]">
+                <div className="relative bg-slate-950/20 border border-panel-border rounded-xl p-2 flex items-center justify-center overflow-hidden flex-1 min-h-[180px]">
                   <canvas 
                     ref={canvasRef} 
                     width={640} 
-                    height={220} 
+                    height={180} 
                     className="w-full h-full block"
                   />
                   
                   {metrics.status === 'CALIBRATING' && (
-                    <div className="absolute inset-0 bg-[#02040ad0]/95 flex flex-col items-center justify-center p-4">
-                      <div className="w-full max-w-sm bg-zinc-900 rounded-full h-2 overflow-hidden border border-zinc-800 mb-4 relative">
+                    <div className="absolute inset-0 bg-slate-950/90 flex flex-col items-center justify-center p-3">
+                      <div className="w-full max-w-xs bg-panel-bg rounded-full h-1.5 overflow-hidden border border-panel-border mb-2.5 relative">
                         <div 
-                          className="bg-gradient-to-r from-cyan-400 to-indigo-500 h-full rounded-full transition-all duration-300 shadow-[0_0_10px_rgba(6,182,212,0.6)]"
+                          className="bg-gradient-to-r from-accent-cyan to-accent-indigo h-full rounded-full transition-all duration-300 shadow-[0_0_10px_rgba(6,182,212,0.6)]"
                           style={{ width: `${metrics.calibration_progress}%` }}
                         ></div>
                       </div>
-                      <span className="text-xs text-cyan-400 font-black tracking-widest animate-pulse uppercase">
-                        Calibrating Photonic Sensors ({metrics.calibration_progress}%)
+                      <span className="text-[9px] text-accent-cyan font-black tracking-widest animate-pulse uppercase">
+                        Aligning Optical Sensors ({metrics.calibration_progress}%)
                       </span>
                     </div>
                   )}
                 </div>
                 
-                <div className="flex items-center justify-between text-[10px] text-zinc-550 mt-2 font-mono uppercase tracking-widest font-bold">
+                <div className="flex items-center justify-between text-[8px] text-text-secondary mt-2 font-mono uppercase tracking-widest font-bold">
                   <span>0.00s</span>
                   <span>10s Rolling Sensor Buffer</span>
                   <span>10.00s</span>
@@ -1288,19 +1362,19 @@ export default function Home() {
 
         {/* VIEW 2: CENTRAL TRIAGE QUEUE */}
         {activeTab === 'queue' && (
-          <div className="bg-[#090e1e]/60 border border-zinc-800/80 rounded-2xl p-6 backdrop-blur-xl shadow-xl flex flex-col min-h-[550px] relative overflow-hidden">
+          <div className="bg-panel-card border border-panel-border rounded-3xl p-6 shadow-sm flex flex-col min-h-[550px] relative overflow-hidden w-full flex-1">
             
-            <div className="flex items-center justify-between border-b border-zinc-800 pb-4 mb-6">
+            <div className="flex items-center justify-between border-b border-panel-border pb-4 mb-6">
               <div>
-                <h2 className="text-base font-black text-white uppercase tracking-wider flex items-center gap-2">
-                  <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-glow-cyan"></span>
-                  Central Dispatch Triage Queue
+                <h2 className="text-base font-black text-text-primary uppercase tracking-wider flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-accent-cyan shadow-[0_0_8px_rgba(6,182,212,0.5)]"></span>
+                  Central Triage Queue
                 </h2>
-                <p className="text-xs text-zinc-450 uppercase tracking-wider font-bold mt-1">Dynamically sorted by Acuity (ESI 1 & 2 prioritize to the top)</p>
+                <p className="text-[10px] text-text-secondary uppercase tracking-widest font-black mt-1">Sorted dynamically by Acuity (ESI levels 1-2 prioritized to top)</p>
               </div>
               <button 
                 onClick={handleClearQueue}
-                className="text-rose-450 hover:text-rose-400 hover:bg-rose-950/40 border border-rose-900/40 text-xs font-black uppercase tracking-widest py-2 px-5 rounded-lg transition-colors"
+                className="text-rose-500 hover:text-rose-450 hover:bg-rose-500/5 border border-rose-500/25 text-xs font-black uppercase tracking-widest py-2 px-5 rounded-xl transition-colors shadow-sm animate-all"
               >
                 Flush Queue
               </button>
@@ -1308,17 +1382,17 @@ export default function Home() {
 
             <div className="flex-1 overflow-y-auto flex flex-col gap-4 pr-1">
               {triageQueue.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-zinc-500 py-24 text-center text-sm font-bold uppercase tracking-widest">
-                  <div className="text-4xl mb-3">📋</div>
-                  <p className="text-zinc-300">Clinical Queue Empty</p>
-                  <p className="text-[10px] text-zinc-550 mt-1 uppercase font-mono">Processed ESI patient records will compile here.</p>
+                <div className="h-full flex flex-col items-center justify-center text-text-secondary py-24 text-center text-sm font-bold uppercase tracking-widest">
+                  <div className="text-4xl mb-4 opacity-50">📋</div>
+                  <p className="text-text-primary">Clinical Queue Empty</p>
+                  <p className="text-[9px] text-text-secondary mt-1 uppercase font-mono">Processed ESI patient records will compile here.</p>
                 </div>
               ) : (
                 triageQueue.map((patient) => (
                   <div 
                     key={patient.id} 
-                    className={`border border-zinc-800 rounded-xl p-5 bg-[#02040a]/40 hover:bg-[#02040a]/75 transition-all flex flex-col md:flex-row md:items-center justify-between gap-6 relative overflow-hidden group ${
-                      patient.is_shock ? 'border-rose-500/50 shadow-glow-red bg-rose-950/5' : 'hover:border-zinc-700'
+                    className={`border border-panel-border rounded-2xl p-5 bg-panel-card/35 hover:bg-panel-card/75 transition-all duration-300 flex flex-col md:flex-row md:items-center justify-between gap-6 relative overflow-hidden group shadow-sm ${
+                      patient.is_shock ? 'border-rose-500/30 shadow-[0_0_15px_rgba(239,68,68,0.03)] bg-rose-500/5' : ''
                     }`}
                   >
                     {/* Urgency Sidebar Indicator */}
@@ -1330,35 +1404,36 @@ export default function Home() {
                       'bg-cyan-500'
                     }`}></div>
 
-                    <div className="flex-1 pl-3">
+                    <div className="flex-1 pl-3.5">
                       <div className="flex flex-wrap items-center gap-4">
-                        <span className="font-black text-white text-base">{patient.name}</span>
-                        <span className="text-xs font-mono text-zinc-550 font-bold uppercase">{patient.timestamp}</span>
+                        <span className="font-black text-text-primary text-base">{patient.name}</span>
+                        <span className="text-[10px] font-mono text-text-secondary font-bold uppercase">{patient.timestamp}</span>
                         {patient.is_shock && (
-                          <span className="text-[10px] bg-red-950 text-red-400 border border-red-900/60 px-2.5 py-0.5 rounded font-black uppercase tracking-widest animate-pulse shadow-glow-red">
-                            ⚠️ COMPENSATED SHOCK ALERT
+                          <span className="text-[9px] bg-rose-500/10 text-rose-500 border border-rose-500/25 px-2.5 py-0.5 rounded font-black uppercase tracking-widest animate-pulse flex items-center gap-1.5 shadow-sm">
+                            <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-ping"></span>
+                            ⚠️ COMPENSATED SHOCK RISK
                           </span>
                         )}
                       </div>
 
-                      <div className="mt-2 text-sm text-zinc-300 leading-relaxed max-w-[1200px] font-sans font-medium">
+                      <div className="mt-2 text-xs text-text-secondary leading-relaxed max-w-[1200px] font-medium">
                         {patient.triage_summary}
                       </div>
 
-                      <div className="mt-3.5 flex flex-wrap items-center gap-6 text-[10px] text-zinc-550 font-bold uppercase tracking-wider">
-                        <span>Record ID: <strong className="text-zinc-300 font-mono">{patient.id}</strong></span>
-                        <span>Acquisition Source: <strong className="text-zinc-300 font-mono">{patient.video_path}</strong></span>
-                        <span>Diagnosis Target: <strong className="text-indigo-400">{patient.primary_diagnosis}</strong></span>
+                      <div className="mt-4 flex flex-wrap items-center gap-5 text-[9px] text-text-secondary font-bold uppercase tracking-wider font-mono">
+                        <span>Record ID: <strong className="text-text-primary">{patient.id}</strong></span>
+                        <span>Source: <strong className="text-text-primary">{patient.video_path}</strong></span>
+                        <span>Clinical Focus: <strong className="text-accent-cyan font-bold">{patient.primary_diagnosis}</strong></span>
                       </div>
                     </div>
 
-                    <div className="flex flex-row md:flex-col items-center gap-3 self-start md:self-auto">
-                      <div className={`border rounded-lg py-2 px-4 text-center min-w-[95px] ${getEsiClass(patient.esi_level)}`}>
-                        <div className="text-[9px] uppercase font-black tracking-widest opacity-85">ESI Level</div>
+                    <div className="flex flex-row md:flex-col items-center gap-3.5 self-start md:self-auto shrink-0">
+                      <div className={`border rounded-xl py-2 px-4 text-center min-w-[95px] shadow-sm ${getEsiClass(patient.esi_level)}`}>
+                        <div className="text-[8px] uppercase font-black tracking-widest opacity-85">ESI Acuity</div>
                         <div className="text-2xl font-black font-mono leading-none mt-1">{patient.esi_level}</div>
                       </div>
-                      <div className="bg-[#090e1e] border border-zinc-800 text-zinc-300 font-mono text-[10px] px-3 py-1.5 rounded text-center min-w-[95px] font-bold uppercase tracking-wider">
-                        Score: {patient.priority_score}
+                      <div className="bg-panel-bg border border-panel-border text-text-secondary font-mono text-[9px] px-3.5 py-1.5 rounded-lg text-center min-w-[95px] font-bold uppercase tracking-wider shadow-sm font-semibold">
+                        Score: <span className="text-text-primary font-black">{patient.priority_score}</span>
                       </div>
                     </div>
                   </div>
@@ -1371,57 +1446,63 @@ export default function Home() {
 
         {/* VIEW 3: AGENT CREW PANEL */}
         {activeTab === 'crew' && (
-          <div className="bg-[#090e1e]/60 border border-zinc-800/80 rounded-2xl p-6 backdrop-blur-xl shadow-xl flex flex-col min-h-[550px] relative overflow-hidden">
+          <div className="bg-panel-card border border-panel-border rounded-3xl p-6 shadow-sm flex flex-col min-h-[550px] relative overflow-hidden w-full flex-1">
             
-            <div className="flex items-center justify-between border-b border-zinc-800 pb-4 mb-6">
+            <div className="flex items-center justify-between border-b border-panel-border pb-4 mb-6">
               <div>
-                <h2 className="text-base font-black text-white uppercase tracking-wider flex items-center gap-2">
-                  <span className="w-2.5 h-2.5 rounded-full bg-purple-500 shadow-[0_0_8px_rgba(139,92,246,0.6)] animate-pulse"></span>
-                  Multi-Agent Clinical Intelligence Crew
+                <h2 className="text-base font-black text-text-primary uppercase tracking-wider flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-accent-cyan shadow-[0_0_8px_rgba(6,182,212,0.5)] animate-pulse"></span>
+                  Clinical Swarm Orchestrator
                 </h2>
-                <p className="text-xs text-zinc-450 uppercase tracking-wider font-bold mt-1">Execution logs of the 3-Agent Decoupled Triage pipeline</p>
+                <p className="text-[10px] text-text-secondary uppercase tracking-widest font-black mt-1">Execution tracking logs of the 3-Agent Decoupled Triage pipeline</p>
               </div>
 
               <button 
                 onClick={() => handleRunTriage()}
                 disabled={isTriageRunning || metrics.status === 'DISCONNECTED'}
-                className="bg-gradient-to-r from-cyan-500 to-indigo-600 hover:from-cyan-600 hover:to-indigo-700 disabled:from-zinc-900 disabled:to-zinc-900 disabled:text-zinc-650 disabled:cursor-not-allowed text-white font-extrabold text-sm py-3 px-6 rounded-xl transition-all shadow-glow-cyan hover:shadow-[0_0_20px_rgba(6,182,212,0.3)] flex items-center gap-2.5 uppercase tracking-wider"
+                className="bg-gradient-to-r from-accent-cyan to-accent-indigo disabled:from-slate-900 disabled:to-slate-900 disabled:text-text-secondary disabled:cursor-not-allowed text-white font-black text-xs py-3 px-6 rounded-xl transition-all shadow-sm flex items-center gap-2.5 uppercase tracking-wider"
               >
                 {isTriageRunning ? (
                   <>
-                    <span className="w-4 h-4 rounded-full border-2 border-white border-t-transparent animate-spin"></span>
-                    Negotiating...
+                    <span className="w-3.5 h-3.5 rounded-full border-2 border-white border-t-transparent animate-spin"></span>
+                    Negotiating Swarm...
                   </>
                 ) : (
                   <>
-                    ⚡ Kickoff Triage Crew
+                    ⚡ Launch Triage Crew
                   </>
                 )}
               </button>
             </div>
 
-            {/* Agent selecting buttons */}
-            <div className="flex border-b border-zinc-800 mb-5 bg-[#030612]/30 rounded-t-xl overflow-hidden">
+            {/* Agent selection tab layout */}
+            <div className="flex gap-2 mb-5 bg-panel-bg/30 p-1.5 rounded-xl border border-panel-border overflow-hidden">
               <button 
                 onClick={() => setActiveAgentTab('perception')}
-                className={`flex-1 py-3.5 text-xs font-black uppercase tracking-widest transition-all ${
-                  activeAgentTab === 'perception' ? 'text-cyan-400 border-b-2 border-cyan-500 bg-[#0e1326]/40 font-black' : 'text-zinc-500 hover:text-zinc-300'
+                className={`flex-1 py-3 text-xs font-black uppercase tracking-widest rounded-lg transition-all ${
+                  activeAgentTab === 'perception' 
+                    ? 'text-accent-cyan bg-panel-card border border-panel-border shadow-sm' 
+                    : 'text-text-secondary hover:text-text-primary'
                 }`}
               >
                 Perception Agent (Vitals Capture)
               </button>
               <button 
                 onClick={() => setActiveAgentTab('diagnostic')}
-                className={`flex-1 py-3.5 text-xs font-black uppercase tracking-widest transition-all ${
-                  activeAgentTab === 'diagnostic' ? 'text-amber-400 border-b-2 border-amber-500 bg-[#0e1326]/40 font-black' : 'text-zinc-500 hover:text-zinc-300'
+                className={`flex-1 py-3 text-xs font-black uppercase tracking-widest rounded-lg transition-all ${
+                  activeAgentTab === 'diagnostic' 
+                    ? 'text-amber-500 bg-panel-card border border-panel-border shadow-sm' 
+                    : 'text-text-secondary hover:text-text-primary'
                 }`}
               >
                 Diagnostic Agent (Acuity Assessment)
               </button>
               <button 
                 onClick={() => setActiveAgentTab('coordinator')}
-                className={`flex-1 py-3.5 text-xs font-black uppercase tracking-widest transition-all ${
-                  activeAgentTab === 'coordinator' ? 'text-indigo-400 border-b-2 border-indigo-500 bg-[#0e1326]/40 font-black' : 'text-zinc-500 hover:text-zinc-300'
+                className={`flex-1 py-3 text-xs font-black uppercase tracking-widest rounded-lg transition-all ${
+                  activeAgentTab === 'coordinator' 
+                    ? 'text-accent-cyan bg-panel-card border border-panel-border shadow-sm' 
+                    : 'text-text-secondary hover:text-text-primary'
                 }`}
               >
                 Coordinator Agent (Queue Placement)
@@ -1429,22 +1510,22 @@ export default function Home() {
             </div>
 
             {/* Main console screen */}
-            <div className="bg-[#02040af0] border border-zinc-850 rounded-xl p-5 flex-1 overflow-y-auto max-h-[420px] font-mono text-sm leading-relaxed text-zinc-300 min-h-[300px] shadow-inner">
+            <div className="bg-slate-950/95 border border-panel-border rounded-2xl p-5 flex-1 overflow-y-auto max-h-[420px] font-mono text-xs leading-relaxed text-emerald-400 min-h-[300px] shadow-inner">
               {isTriageRunning && (
-                <div className="h-full flex flex-col items-center justify-center text-zinc-500 py-16 gap-4">
-                  <div className="w-10 h-10 rounded-full border-2 border-cyan-500 border-t-transparent animate-spin shadow-glow-cyan"></div>
+                <div className="h-full flex flex-col items-center justify-center text-text-secondary py-16 gap-4">
+                  <div className="w-8 h-8 rounded-full border-2 border-accent-cyan border-t-transparent animate-spin"></div>
                   <div className="text-center font-sans">
-                    <p className="text-sm font-black text-zinc-200 uppercase tracking-wider">Multi-Agent Negotiation Active</p>
-                    <p className="text-xs text-zinc-500 mt-2 max-w-[340px] leading-relaxed uppercase tracking-widest font-bold">Consolidating rPPG bio-telemetry, analyzing shock state indicators, and prioritizing patients...</p>
+                    <p className="text-xs font-black text-text-primary uppercase tracking-widest">Multi-Agent Negotiation Active</p>
+                    <p className="text-[10px] text-text-secondary mt-1 max-w-[400px] leading-relaxed uppercase tracking-widest font-black">Consolidating rPPG bio-telemetry, analyzing shock state indicators, and prioritizing patients...</p>
                   </div>
                 </div>
               )}
 
               {!isTriageRunning && !lastTriageResult && (
-                <div className="h-full flex items-center justify-center text-zinc-500 text-center py-20 font-sans uppercase tracking-widest text-xs font-bold">
+                <div className="h-full flex items-center justify-center text-text-secondary text-center py-20 font-sans uppercase tracking-widest text-[10px] font-black">
                   <div>
-                    <p>Sensor pipeline idle.</p>
-                    <p className="text-zinc-650 mt-1.5 text-[10px] uppercase font-mono">Upload a record or start live webcam and trigger Triage Crew.</p>
+                    <p className="opacity-75">Sensor pipeline idle.</p>
+                    <p className="text-text-secondary/60 mt-1 uppercase font-mono">Upload a record or start live webcam and trigger Triage Crew.</p>
                   </div>
                 </div>
               )}
@@ -1453,11 +1534,11 @@ export default function Home() {
                 <div>
                   {activeAgentTab === 'perception' && (
                     <div className="flex flex-col gap-3">
-                      <div className="text-zinc-400 border-b border-zinc-850 pb-3 mb-2 font-sans font-bold text-xs uppercase text-cyan-400 tracking-wider flex items-center justify-between">
+                      <div className="text-text-secondary border-b border-panel-border/30 pb-3 mb-2 font-sans font-black text-[10px] uppercase text-accent-cyan tracking-wider flex items-center justify-between">
                         <span>Perception Analysis Log</span>
-                        <span>[COMPILED]</span>
+                        <span>[COMPILED SUCCESS]</span>
                       </div>
-                      <div className="whitespace-pre-wrap font-mono leading-relaxed">
+                      <div className="whitespace-pre-wrap font-mono leading-relaxed font-semibold">
                         {`Patient Record: ${lastTriageResult.name}\nTimestamp: ${lastTriageResult.timestamp}\n\nACQUIRED PHYSIOLOGY:\n- Path: ${lastTriageResult.video_path}\n- Core Metrics Resolved:\n  • Heart Rate: ${metrics.bpm} BPM\n  • Respiration Rate: ${metrics.rr} breaths/min\n  • HRV: ${metrics.hrv.toFixed(1)} ms\n  • Stress Index: ${metrics.stress_index.toFixed(0)}\n  • Signal SNR: ${metrics.snr_db.toFixed(1)} dB\n\nDiagnostic buffer synchronized.`}
                       </div>
                     </div>
@@ -1465,11 +1546,11 @@ export default function Home() {
 
                   {activeAgentTab === 'diagnostic' && (
                     <div className="flex flex-col gap-3">
-                      <div className="text-zinc-400 border-b border-zinc-850 pb-3 mb-2 font-sans font-bold text-xs uppercase text-amber-400 tracking-wider flex items-center justify-between">
+                      <div className="text-text-secondary border-b border-panel-border/30 pb-3 mb-2 font-sans font-black text-[10px] uppercase text-amber-500 tracking-wider flex items-center justify-between">
                         <span>Clinical Diagnostic Assessment</span>
-                        <span>[COMPILED]</span>
+                        <span>[COMPILED SUCCESS]</span>
                       </div>
-                      <div className="whitespace-pre-wrap font-mono leading-relaxed">
+                      <div className="whitespace-pre-wrap font-mono leading-relaxed font-semibold">
                         {`DIAGNOSIS PATHOLOGY:\n- Recommended Index: ESI LEVEL ${lastTriageResult.esi_level}\n- Clinical Focus: ${lastTriageResult.primary_diagnosis}\n- Compensated Shock: ${lastTriageResult.is_shock ? "⚠️ SHOCK CRITERIA SATISFIED" : "STABLE / NO SHOCK"}\n\nESI CORRELATION LOGIC:\n- Cross-correlation analysis: HR (${metrics.bpm}) × RR (${metrics.rr})\n- Clinical documentation resolved.\n\nRaw decision trace:\n${lastTriageResult.agent_output.substring(0, 1500)}...`}
                       </div>
                     </div>
@@ -1477,35 +1558,35 @@ export default function Home() {
 
                   {activeAgentTab === 'coordinator' && (
                     <div className="flex flex-col gap-4 font-sans p-2">
-                      <div className="text-zinc-400 border-b border-zinc-850 pb-3 mb-2 font-sans font-bold text-xs uppercase text-indigo-400 tracking-wider flex items-center justify-between">
+                      <div className="text-text-secondary border-b border-panel-border/30 pb-3 mb-2 font-sans font-black text-[10px] uppercase text-accent-cyan tracking-wider flex items-center justify-between">
                         <span>Dynamic Queue Allocation</span>
-                        <span>[COMPILED]</span>
+                        <span>[COMPILED SUCCESS]</span>
                       </div>
                       
                       <div className="grid grid-cols-2 gap-4">
-                        <div className="bg-[#060813] border border-zinc-800 rounded-lg p-4 text-center shadow-glow-cyan">
-                          <div className="text-[10px] text-zinc-500 font-extrabold uppercase tracking-wider">Acuity Level</div>
-                          <div className="text-4xl font-black text-indigo-400 mt-2 font-mono">Level {lastTriageResult.esi_level}</div>
+                        <div className="bg-panel-bg border border-panel-border rounded-xl p-4 text-center">
+                          <div className="text-[9px] text-text-secondary font-black uppercase tracking-wider">Acuity Level</div>
+                          <div className="text-3xl font-black text-accent-cyan mt-1 font-mono">Level {lastTriageResult.esi_level}</div>
                         </div>
-                        <div className="bg-[#060813] border border-zinc-800 rounded-lg p-4 text-center">
-                          <div className="text-[10px] text-zinc-500 font-extrabold uppercase tracking-wider">Priority Rating</div>
-                          <div className="text-4xl font-black text-cyan-400 mt-2 font-mono">{lastTriageResult.priority_score}/100</div>
+                        <div className="bg-panel-bg border border-panel-border rounded-xl p-4 text-center">
+                          <div className="text-[9px] text-text-secondary font-black uppercase tracking-wider">Priority Rating</div>
+                          <div className="text-3xl font-black text-accent-cyan mt-1 font-mono">{lastTriageResult.priority_score}/100</div>
                         </div>
                       </div>
 
-                      <div className="bg-[#060813] border border-zinc-800 rounded-lg p-4">
-                        <div className="text-[10px] text-zinc-500 font-extrabold uppercase tracking-wider mb-2 font-bold">Primary Clinical Indicator</div>
+                      <div className="bg-panel-bg border border-panel-border rounded-xl p-4">
+                        <div className="text-[9px] text-text-secondary font-black uppercase tracking-wider mb-2">Primary Clinical Indicator</div>
                         <div className="flex items-center gap-3">
-                          <span className={`w-3.5 h-3.5 rounded-full ${lastTriageResult.is_shock ? 'bg-red-500 animate-ping shadow-[0_0_8px_#ef4444]' : 'bg-emerald-500'}`}></span>
-                          <span className={`text-sm font-bold ${lastTriageResult.is_shock ? 'text-rose-400 font-black' : 'text-zinc-200'}`}>
+                          <span className={`w-3 h-3 rounded-full ${lastTriageResult.is_shock ? 'bg-red-500 animate-ping shadow-[0_0_8px_#ef4444]' : 'bg-emerald-500'}`}></span>
+                          <span className={`text-sm font-bold ${lastTriageResult.is_shock ? 'text-rose-500' : 'text-text-primary'}`}>
                             {lastTriageResult.primary_diagnosis} {lastTriageResult.is_shock && "(Shock Indicator Active)"}
                           </span>
                         </div>
                       </div>
 
-                      <div className="bg-[#02040a] border border-zinc-800 rounded-lg p-4">
-                        <div className="text-[10px] text-zinc-500 font-extrabold uppercase tracking-wider mb-2 font-bold">Triage Summary & Rationale</div>
-                        <p className="text-sm leading-relaxed text-zinc-200 font-medium">{lastTriageResult.triage_summary}</p>
+                      <div className="bg-panel-bg border border-panel-border rounded-xl p-4">
+                        <div className="text-[9px] text-text-secondary font-black uppercase tracking-wider mb-2">Triage Summary & Rationale</div>
+                        <p className="text-xs leading-relaxed text-text-primary font-semibold">{lastTriageResult.triage_summary}</p>
                       </div>
                     </div>
                   )}
@@ -1516,143 +1597,279 @@ export default function Home() {
           </div>
         )}
 
-        {/* VIEW 4: ARIA CLINICAL ASSISTANT */}
+        {/* VIEW 4: CLINICAL CONSULT (SPLIT-WORKSPACE) */}
         {activeTab === 'chat' && (
-          <div className="bg-[#090e1e]/60 border border-zinc-800/80 rounded-2xl p-6 backdrop-blur-xl shadow-xl flex flex-col min-h-[600px] relative overflow-hidden">
+          <div className="bg-panel-card border border-panel-border rounded-3xl p-6 pb-4 shadow-sm flex flex-col flex-1 h-[calc(100vh-6rem)] max-h-[calc(100vh-6rem)] relative overflow-hidden w-full justify-between">
             
-            {/* ARIA Header */}
-            <div className="flex items-center justify-between border-b border-zinc-800/80 pb-5 mb-5">
-              <div className="flex items-center gap-4">
-                <div className="w-12 h-12 rounded-xl bg-gradient-to-tr from-indigo-500 via-purple-500 to-pink-500 flex items-center justify-center shadow-lg shadow-indigo-500/20 relative overflow-hidden shrink-0">
-                  <div className="absolute inset-0 bg-white/10 mix-blend-overlay"></div>
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><path d="M12 2a10 10 0 110 20A10 10 0 0112 2z" opacity="0.3"/><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="2" fill="white"/></svg>
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-panel-border pb-4 mb-4 w-full">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-panel-bg border border-panel-border flex items-center justify-center shadow-sm shrink-0">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent-cyan)" strokeWidth="2">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                  </svg>
                 </div>
                 <div>
-                  <div className="flex items-center gap-2">
-                    <h2 className="text-lg font-black text-white tracking-tight">ARIA</h2>
-                    <span className="text-[9px] font-extrabold uppercase tracking-widest bg-indigo-950/80 text-indigo-400 border border-indigo-800/60 px-2 py-0.5 rounded">Adaptive Real-time Intelligence for Acute-care</span>
+                  <div className="flex items-center gap-2.5">
+                    <h2 className="text-sm font-black text-text-primary uppercase tracking-wider">Clinical Consult</h2>
+                    <span className="text-[8px] font-black uppercase tracking-widest bg-accent-cyan/15 text-accent-cyan border border-accent-cyan/25 px-2 py-0.5 rounded">Active Assistant</span>
                   </div>
-                  <p className="text-[10px] text-zinc-500 font-bold uppercase tracking-widest mt-0.5">Powered by NVIDIA NIM · OCR Document Parsing · Multilingual · Evidence-Based</p>
+                  <p className="text-[9px] text-text-secondary font-black uppercase tracking-widest mt-0.5">Integrative Diagnostic Consult · OCR History Analysis · Guided Protocol Reference</p>
                 </div>
               </div>
-              <div className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest">
-                <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse"></span>
-                <span className="text-indigo-400">ARIA Online</span>
+              <div className="flex items-center gap-2 text-[9px] font-black uppercase tracking-widest bg-panel-bg border border-panel-border px-3 py-1.5 rounded-lg">
+                <span className="w-2 h-2 rounded-full bg-accent-cyan animate-pulse"></span>
+                <span className="text-text-secondary">SYSTEM BIND ACTIVE</span>
               </div>
             </div>
 
-            {/* Chat message bubbles */}
-            <div className="flex-1 bg-[#02040af0] border border-zinc-850 rounded-xl p-5 overflow-y-auto max-h-[360px] flex flex-col gap-4 mb-4 shadow-inner min-h-[300px]">
-              {chatHistory.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-zinc-550 text-center py-16">
-                  <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-indigo-500/20 to-purple-500/10 border border-indigo-800/30 flex items-center justify-center mb-4 mx-auto">
-                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="rgb(129,140,248)" strokeWidth="1.5"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
-                  </div>
-                  <p className="text-zinc-200 font-black text-sm uppercase tracking-wider">ARIA Clinical Intelligence Ready</p>
-                  <p className="text-[11px] text-zinc-500 mt-2 max-w-[460px] leading-relaxed font-semibold">Ask clinical questions, request differential diagnoses, interpret vital signs, or attach photos of patient records and lab reports for instant OCR analysis.</p>
-                  <div className="mt-5 flex flex-wrap gap-2 justify-center max-w-[500px]">
-                    {['What does BRADYPNEA indicate?', 'Explain ESI Level 2', 'Interpret high stress index', 'Normal rPPG heart rate range'].map(s => (
-                      <button key={s} onClick={() => setChatInput(s)} className="text-[10px] bg-indigo-950/60 hover:bg-indigo-950/80 border border-indigo-800/40 text-indigo-300 px-3 py-1.5 rounded-lg font-bold uppercase tracking-wider transition-colors">{s}</button>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                chatHistory.map((msg, idx) => (
-                  <div key={idx} className={`flex flex-col max-w-[85%] ${msg.role === 'user' ? 'self-end items-end' : 'self-start items-start'}`}>
-                    <span className="text-[9px] text-zinc-500 font-extrabold uppercase tracking-widest mb-1.5">
-                      {msg.role === 'user' ? 'Clinician' : 'ARIA'}
-                    </span>
-                    
-                    <div className={`p-4 rounded-xl text-sm leading-relaxed font-semibold whitespace-pre-wrap ${
-                      msg.role === 'user' 
-                        ? 'bg-indigo-950/80 text-zinc-100 border border-indigo-900/60 rounded-tr-none shadow-glow-cyan' 
-                        : 'bg-zinc-900/60 text-zinc-250 border border-zinc-800 rounded-tl-none'
-                    }`}>
-                      {/* Attached Image inside Bubble */}
-                      {msg.image && (
-                        <div className="mb-3 max-w-[200px] rounded-lg overflow-hidden border border-zinc-850">
-                          <img src={msg.image} alt="Clinical document" className="w-full h-auto object-cover" />
-                        </div>
-                      )}
-                      {msg.content.replace(/^\[[a-z]{2}-[A-Z]{2}\]\s*/i, '').replace(/\*\*/g, '').replace(/\* /g, '• ')}
-                    </div>
-                  </div>
-                ))
-              )}
+            {/* Split Workspace Body */}
+            <div className="flex flex-1 gap-6 overflow-hidden min-h-0">
               
-              {isChatLoading && (
-                <div className="self-start flex items-center gap-2.5 text-xs text-cyan-400 uppercase tracking-widest font-black font-mono">
-                  <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-ping"></span>
-                  Decoding Telemetry...
+              {/* Left Panel: Clinical Intake Summary Context */}
+              <div className="hidden lg:flex flex-col gap-4 border-r border-panel-border/40 pr-6 w-72 shrink-0 justify-between">
+                <div className="space-y-4">
+                  <div className="text-[9px] text-text-secondary font-black uppercase tracking-widest">Active Patient Telemetry</div>
+                  
+                  {/* Select Dropdown to load database record */}
+                  <div className="bg-panel-bg border border-panel-border rounded-xl p-3 shadow-sm flex flex-col gap-1.5">
+                    <label className="text-[8px] text-text-secondary font-black uppercase tracking-wider">Select Patient Target</label>
+                    <select
+                      value={selectedConsultPatientId || ''}
+                      onChange={(e) => setSelectedConsultPatientId(e.target.value || null)}
+                      className="w-full bg-panel-card border border-panel-border rounded-lg text-xs p-2 text-text-primary outline-none focus:border-accent-cyan cursor-pointer appearance-none font-bold"
+                    >
+                      <option value="">-- Active Live Telemetry --</option>
+                      {triageQueue.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} (ESI {p.esi_level})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Vitals Summary Card Details */}
+                  {(() => {
+                    const consultPatient = selectedConsultPatientId 
+                      ? triageQueue.find(p => p.id === selectedConsultPatientId) 
+                      : null;
+                    
+                    return (
+                      <div className="space-y-2.5">
+                        <div className="bg-panel-bg border border-panel-border rounded-xl p-3.5 shadow-sm">
+                          <div className="text-[8px] text-text-secondary uppercase tracking-wider font-bold">Identified Subject</div>
+                          <div className="text-xs font-black text-text-primary truncate mt-1">
+                            {consultPatient ? consultPatient.name : (patientName || 'Anonymous / Intake Subject')}
+                          </div>
+                        </div>
+
+                        <div className="bg-panel-bg border border-panel-border rounded-xl p-3.5 shadow-sm">
+                          <div className="text-[8px] text-text-secondary uppercase tracking-wider font-bold">Intake Vital Readings</div>
+                          <div className="mt-2 space-y-2 font-mono text-[10px]">
+                            <div className="flex justify-between items-center py-0.5">
+                              <span className="text-text-secondary">Heart Rate</span>
+                              <span className="text-text-primary font-black">
+                                {consultPatient 
+                                  ? (consultPatient.heart_rate && consultPatient.heart_rate > 0 ? `${consultPatient.heart_rate.toFixed(0)} BPM` : '--') 
+                                  : (metrics.bpm > 0 ? `${metrics.bpm} BPM` : '--')}
+                              </span>
+                            </div>
+                            <div className="flex justify-between items-center py-0.5">
+                              <span className="text-text-secondary">Respiration</span>
+                              <span className="text-text-primary font-black">
+                                {consultPatient 
+                                  ? (consultPatient.respiration && consultPatient.respiration > 0 ? `${consultPatient.respiration.toFixed(1)} B/min` : '--') 
+                                  : (metrics.rr > 0 ? `${metrics.rr.toFixed(1)} B/min` : '--')}
+                              </span>
+                            </div>
+                            <div className="flex justify-between items-center py-0.5">
+                              <span className="text-text-secondary">Stress Index</span>
+                              <span className="text-text-primary font-black">
+                                {consultPatient 
+                                  ? (consultPatient.stress_index && consultPatient.stress_index > 0 ? consultPatient.stress_index.toFixed(0) : '--') 
+                                  : (metrics.stress_index > 0 ? metrics.stress_index.toFixed(0) : '--')}
+                              </span>
+                            </div>
+                            <div className="flex justify-between items-center py-0.5">
+                              <span className="text-text-secondary">HRV (RMSSD)</span>
+                              <span className="text-text-primary font-black">
+                                {consultPatient 
+                                  ? (consultPatient.hrv && consultPatient.hrv > 0 ? `${consultPatient.hrv.toFixed(0)} ms` : '--') 
+                                  : (metrics.hrv > 0 ? `${metrics.hrv.toFixed(0)} ms` : '--')}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="bg-panel-bg border border-panel-border rounded-xl p-3.5 shadow-sm">
+                          <div className="text-[8px] text-text-secondary uppercase tracking-wider font-bold">Assigned Acuity Profile</div>
+                          {consultPatient ? (
+                            <div className="mt-2 space-y-2 text-[10px] font-semibold">
+                              <div className="flex justify-between items-center">
+                                <span className="text-text-secondary">ESI Rating</span>
+                                <span className="text-accent-cyan font-black">Level {consultPatient.esi_level}</span>
+                              </div>
+                              <div className="flex justify-between items-center">
+                                <span className="text-text-secondary">Priority Score</span>
+                                <span className="text-text-primary font-mono">{consultPatient.priority_score}/100</span>
+                              </div>
+                              <div className="flex justify-between items-center">
+                                <span className="text-text-secondary">Shock State</span>
+                                <span className={consultPatient.is_shock ? 'text-rose-500 font-black' : 'text-emerald-500'}>
+                                  {consultPatient.is_shock ? 'SHOCK CRITERIA' : 'STABLE'}
+                                </span>
+                              </div>
+                            </div>
+                          ) : lastTriageResult ? (
+                            <div className="mt-2 space-y-2 text-[10px] font-semibold">
+                              <div className="flex justify-between items-center">
+                                <span className="text-text-secondary">ESI Rating</span>
+                                <span className="text-accent-cyan font-black">Level {lastTriageResult.esi_level}</span>
+                              </div>
+                              <div className="flex justify-between items-center">
+                                <span className="text-text-secondary">Priority Score</span>
+                                <span className="text-text-primary font-mono">{lastTriageResult.priority_score}/100</span>
+                              </div>
+                              <div className="flex justify-between items-center">
+                                <span className="text-text-secondary">Shock State</span>
+                                <span className={lastTriageResult.is_shock ? 'text-rose-500 font-black' : 'text-emerald-500'}>
+                                  {lastTriageResult.is_shock ? 'SHOCK CRITERIA' : 'STABLE'}
+                                </span>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="text-[10px] text-text-secondary mt-1.5 italic font-bold">No ESI Acuity resolved. Run triage swarm.</div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
-              )}
-              <div ref={chatEndRef}></div>
+
+                <div className="text-[8px] text-text-secondary/70 leading-relaxed font-bold uppercase tracking-wider">
+                  💡 consult assistant inherits read-only context of current postgres telemetry buffers.
+                </div>
+              </div>
+
+              {/* Right Panel: Chat Consult Feed */}
+              <div className="flex-1 flex flex-col justify-between overflow-hidden min-h-0">
+                <div className="flex-grow bg-panel-bg/30 border border-panel-border rounded-2xl p-5 overflow-y-auto flex flex-col gap-4 shadow-inner min-h-0">
+                  {chatHistory.length === 0 ? (
+                    <div className="h-full flex flex-col items-center justify-center text-text-secondary text-center py-16">
+                      <div className="w-11 h-11 rounded-2xl bg-panel-bg border border-panel-border flex items-center justify-center mb-3 shadow-sm">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" strokeWidth="2">
+                          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                        </svg>
+                      </div>
+                      <p className="text-text-primary font-black text-sm uppercase tracking-wider">Clinical Consult Session Ready</p>
+                      <p className="text-xs text-text-secondary mt-1 max-w-[400px] leading-relaxed font-semibold">
+                        Submit questions regarding the subject's vital metrics, request differential diagnostics, or attach intake charts/lab records for direct OCR analysis.
+                      </p>
+                      <div className="mt-4 flex flex-wrap gap-2 justify-center max-w-[480px]">
+                        {['Explain ESI level guidelines', 'What does high stress indicate?', 'OCR parse blood report'].map(s => (
+                          <button key={s} onClick={() => setChatInput(s)} className="text-xs bg-panel-bg border border-panel-border text-text-secondary hover:text-text-primary px-3 py-1.5 rounded-lg font-bold uppercase tracking-wider transition-colors shadow-sm">{s}</button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    chatHistory.map((msg, idx) => (
+                      <div key={idx} className={`flex flex-col max-w-[85%] ${msg.role === 'user' ? 'self-end items-end' : 'self-start items-start'}`}>
+                        <span className="text-[8px] text-text-secondary font-black uppercase tracking-widest mb-1">
+                          {msg.role === 'user' ? 'Clinician' : 'ARIA'}
+                        </span>
+                        
+                        <div className={`p-3.5 rounded-2xl text-sm leading-relaxed font-semibold whitespace-pre-wrap ${
+                          msg.role === 'user' 
+                            ? 'bg-sky-950/20 text-text-primary border border-sky-850/30 rounded-tr-none shadow-sm' 
+                            : 'bg-panel-card text-text-primary border border-panel-border rounded-tl-none shadow-sm'
+                        }`}>
+                          {msg.image && (
+                            <div className="mb-2 max-w-[180px] rounded-lg overflow-hidden border border-panel-border shadow-sm">
+                              <img src={msg.image} alt="Clinical record attachment" className="w-full h-auto object-cover" />
+                            </div>
+                          )}
+                          {msg.content.replace(/^\[[a-z]{2}-[A-Z]{2}\]\s*/i, '').replace(/\*\*/g, '').replace(/\* /g, '• ')}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                  {isChatLoading && (
+                    <div className="self-start flex items-center gap-2 text-[9px] text-accent-cyan uppercase tracking-widest font-black font-mono animate-pulse bg-panel-card px-3 py-1.5 rounded-lg border border-panel-border shadow-sm">
+                      <span className="w-2 h-2 rounded-full bg-accent-cyan animate-ping"></span>
+                      Consulting Engine...
+                    </div>
+                  )}
+                  <div ref={chatEndRef}></div>
+                </div>
+
+                {/* Input Form at bottom */}
+                <form onSubmit={handleSendChatMessage} className="flex flex-col gap-2 mt-2 w-full">
+                  {selectedImage && (
+                    <div className="flex items-center gap-3 p-3 bg-panel-bg/40 border border-panel-border rounded-xl animate-pulse shadow-sm">
+                      <div className="w-9 h-9 rounded-lg overflow-hidden border border-panel-border relative">
+                        <img src={selectedImage} alt="Preview" className="w-full h-full object-cover" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[10px] font-bold text-text-primary truncate">Intake Document Attachment Loaded</p>
+                        <p className="text-[8px] text-text-secondary uppercase font-mono tracking-wider font-bold">Ready for OCR parsing</p>
+                      </div>
+                      <button 
+                        type="button" 
+                        onClick={() => setSelectedImage(null)}
+                        className="text-rose-500 hover:text-rose-450 font-black text-[9px] p-2 uppercase tracking-wider"
+                      >
+                        ✕ remove
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="flex gap-2">
+                    <input 
+                      type="file" 
+                      accept="image/*" 
+                      ref={imageInputRef}
+                      onChange={handleImageAttachment}
+                      className="hidden"
+                    />
+                    <button 
+                      type="button"
+                      onClick={() => imageInputRef.current?.click()}
+                      className="p-3 rounded-xl border border-panel-border bg-panel-card text-text-secondary hover:text-text-primary hover:border-text-secondary/35 transition-all text-xs font-bold shadow-sm"
+                      title="Attach Document Photo"
+                    >
+                      📎 Attach
+                    </button>
+                    <button 
+                      type="button"
+                      onClick={toggleRecording}
+                      className={`p-3 rounded-xl border transition-all text-xs font-bold shadow-sm ${
+                        isRecording 
+                          ? 'bg-rose-500/10 text-rose-500 border-rose-500/35 animate-pulse' 
+                          : 'bg-panel-card text-text-secondary border-panel-border hover:text-text-primary hover:border-text-secondary/35'
+                      }`}
+                      title="Voice Input (STT)"
+                    >
+                      🎙️ Speak
+                    </button>
+                    <input 
+                      type="text"
+                      value={chatInput}
+                      onChange={(e) => setChatInput(e.target.value)}
+                      placeholder="Ask ARIA about active patient biometrics, ESI metrics, or clinical protocols..."
+                      className="flex-1 bg-panel-bg border border-panel-border rounded-xl text-sm px-3.5 text-text-primary outline-none focus:border-accent-cyan transition-all shadow-inner font-semibold"
+                    />
+                    <button 
+                      type="submit"
+                      disabled={isChatLoading || (!chatInput.trim() && !selectedImage)}
+                      className="bg-accent-cyan/15 hover:bg-accent-cyan/25 border border-accent-cyan/30 text-accent-cyan font-black text-xs py-3 px-5 rounded-xl transition-all disabled:opacity-40 disabled:cursor-not-allowed uppercase tracking-wider shadow-sm"
+                    >
+                      Send
+                    </button>
+                  </div>
+                </form>
+              </div>
             </div>
 
-            {/* Input form */}
-            <form onSubmit={handleSendChatMessage} className="flex flex-col gap-3">
-              {/* Selected Image preview box */}
-              {selectedImage && (
-                <div className="flex items-center gap-3 p-3 bg-[#02040a]/60 border border-zinc-850 rounded-xl animate-pulse">
-                  <div className="w-12 h-12 rounded-lg overflow-hidden border border-zinc-800 relative">
-                    <img src={selectedImage} alt="Attachment Preview" className="w-full h-full object-cover" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs font-bold text-zinc-300 truncate">Clinical Document Attachment Loaded</p>
-                    <p className="text-[9px] text-zinc-500 uppercase font-mono tracking-wider font-semibold">Ready for NVIDIA NIM OCR parsing</p>
-                  </div>
-                  <button 
-                    type="button" 
-                    onClick={() => setSelectedImage(null)}
-                    className="text-rose-400 hover:text-rose-350 font-black text-sm p-2"
-                  >
-                    ✕ remove
-                  </button>
-                </div>
-              )}
-
-              <div className="flex gap-3">
-                <input 
-                  type="file" 
-                  accept="image/*" 
-                  ref={imageInputRef}
-                  onChange={handleImageAttachment}
-                  className="hidden"
-                />
-                <button 
-                  type="button"
-                  onClick={() => imageInputRef.current?.click()}
-                  className="p-3.5 rounded-xl border border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-850 transition-colors text-sm"
-                  title="Attach Document Photo"
-                >
-                  📎 Attach
-                </button>
-                <button 
-                  type="button"
-                  onClick={toggleRecording}
-                  className={`p-3.5 rounded-xl border transition-colors text-sm font-bold ${
-                    isRecording ? 'bg-rose-950 text-rose-400 border-rose-800 animate-pulse' : 'bg-zinc-900 text-zinc-400 border-zinc-800 hover:bg-zinc-850'
-                  }`}
-                  title="Voice Input (STT)"
-                >
-                  🎙️ Speak
-                </button>
-                <input 
-                  type="text"
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  placeholder={selectedImage ? "Add clinical context or ask ARIA to parse this document..." : "Ask ARIA about vital signs, diagnoses, ESI levels, or clinical protocols..."}
-                  className="flex-1 bg-[#02040a] border border-zinc-800 rounded-xl text-sm px-4 text-zinc-150 outline-none focus:border-cyan-500 transition-colors"
-                />
-                <button 
-                  type="submit"
-                  disabled={isChatLoading || (!chatInput.trim() && !selectedImage)}
-                  className="bg-indigo-950 hover:bg-indigo-900 text-indigo-400 border border-indigo-850 font-bold text-xs py-3 px-6 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed uppercase tracking-wider"
-                >
-                  Send
-                </button>
-              </div>
-            </form>
           </div>
         )}
 

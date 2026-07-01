@@ -1,0 +1,39 @@
+sequenceDiagram
+    autonumber
+    actor Clinician
+    participant UI as Next.js Dashboard (page.tsx)
+    participant Flask as Flask Backend (app.py)
+    participant Swarm as CrewAI Swarm (crew.py)
+    participant Neon as Neon PostgreSQL DB
+
+    Note over Clinician, UI: Start Live Session
+    Clinician->>UI: Enter Patient Name & Click "Init Sensors"
+    UI->>Flask: POST /start_webcam { source: index }
+    Flask-->>UI: Success status (Start MJPEG video stream)
+
+    loop Real-Time Telemetry (every 300ms)
+        UI->>Flask: GET /status
+        Flask-->>UI: Return Metrics (BPM, RR, SNR, PPG Signal)
+        Note over UI: Draw PPG Wave on Canvas & Pulsate Heart Emoji
+    end
+
+    Note over UI, Flask: 30-Second Data Acquisition Window
+    UI->>UI: Calibration Complete -> Start 30s Countdown
+    UI->>Flask: POST /api/generate_report (on timer end)
+    Flask-->>UI: Return Average Vitals and Clinical Summary
+
+    Note over UI, Swarm: Clinical Triage Execution
+    UI->>Flask: POST /api/triage_run { patient_name }
+    Flask->>Swarm: Run sequential agent execution
+    Note over Swarm: Perception -> Diagnostic (ESI & Shock) -> Coordinator (Priority Score)
+    Swarm->>Neon: INSERT INTO triage_records (id, name, vitals, ESI, is_shock)
+    Swarm-->>Flask: Return Agent Logs and Queue Data
+    Flask-->>UI: Return Patient Record
+    UI->>UI: Populate Agent Tab Logs (Perception/Diagnostic/Coordinator)
+
+    Note over UI, Neon: Queue Synchronization
+    UI->>Flask: GET /api/triage_queue
+    Flask->>Neon: SELECT * FROM triage_records ORDER BY priority_score DESC
+    Neon-->>Flask: Sorted list of records
+    Flask-->>UI: JSON Payload
+    UI->>UI: Redraw Triage Queue (Acuity Badges & Shock Alerts)

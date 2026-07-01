@@ -1,26 +1,84 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #07080b;
+  --foreground: #e2e8f0;
+  
+  --panel-bg: #07080b;
+  --panel-card: rgba(18, 22, 33, 0.5);
+  --panel-border: rgba(255, 255, 255, 0.05);
+  --panel-border-glow: rgba(56, 189, 248, 0.08);
+  
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
+  --text-muted: #475569;
+  
+  --accent-cyan: #38bdf8;
+  --accent-indigo: #0ea5e9;
+}
+
+.light {
+  --background: #f8fafc;
+  --foreground: #0f172a;
+  
+  --panel-bg: #f8fafc;
+  --panel-card: rgba(255, 255, 255, 0.9);
+  --panel-border: rgba(15, 23, 42, 0.08);
+  --panel-border-glow: rgba(6, 182, 212, 0.08);
+  
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #64748b;
+  
+  --accent-cyan: #0891b2;
+  --accent-indigo: #4f46e5;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-panel-bg: var(--panel-bg);
+  --color-panel-card: var(--panel-card);
+  --color-panel-border: var(--panel-border);
+  --color-panel-border-glow: var(--panel-border-glow);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted: var(--text-muted);
+  --color-accent-cyan: var(--accent-cyan);
+  --color-accent-indigo: var(--accent-indigo);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans), system-ui, -apple-system, sans-serif;
+  overflow-x: hidden;
 }
+
+/* Custom modern scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.15);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.3);
+}
+
+/* Animations for modern aesthetics */
+@keyframes heartPulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.1); }
+}
+.animate-heart-pulse {
+  animation: heartPulse 0.8s infinite ease-in-out;
+}
+

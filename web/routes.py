@@ -8,6 +8,7 @@ import os
 import threading
 import json
 import re
+import base64
 
 # Import the web package which holds our shared state and configurations
 import web
@@ -477,18 +478,167 @@ def image_feed():
     return Response(web.session.image_frame_bytes, mimetype='image/jpeg')
 
 
+@app.route('/api/stream_frame', methods=['POST'])
+def stream_frame():
+    try:
+        data = request.json or {}
+        image_b64 = data.get('image', '')
+        if not image_b64:
+            return jsonify({'success': False, 'error': 'No image frame provided'}), 400
+            
+        header, encoded = image_b64.split(",", 1) if "," in image_b64 else ("", image_b64)
+        frame_bytes = base64.b64decode(encoded)
+        np_arr = np.frombuffer(frame_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            return jsonify({'success': False, 'error': 'Failed to decode image frame'}), 400
+            
+        if not web.session.is_live_camera:
+            web.session.is_live_camera = True
+            web.session.start_time = time.time()
+            web.session.frame_count = 0
+            web.session.bpm_history = []
+            web.session.last_valid_hrv = 0.0
+            web.session.last_valid_stress = 0.0
+            web.rppg_engine.reset()
+            
+        web.session.frame_count += 1
+        elapsed = time.time() - web.session.start_time
+        
+        if web.camera.use_mediapipe:
+            roi_data, _, motion_delta = web.camera._extract_roi_mediapipe(frame)
+        else:
+            roi_data, _, motion_delta = web.camera._extract_roi_haar(frame)
+            
+        lux = 0
+        is_moving = web.camera.is_moving
+        if roi_data is not None:
+            r_ch, g_ch, b_ch = roi_data
+            lux = int(0.299 * r_ch + 0.587 * g_ch + 0.114 * b_ch)
+            
+        web.session.metrics['estimated_lux'] = lux
+        web.session.metrics['motion_delta']  = int(motion_delta)
+        
+        warnings = []
+        if is_moving or motion_delta > 15.0:
+            warnings.append("Excessive motion — please stay still")
+        if roi_data is not None and (lux < 50 or lux > 210):
+            warnings.append("Poor lighting — move to better light")
+            
+        if roi_data is not None:
+            web.rppg_engine.add_frame(roi_data, elapsed)
+            results = web.rppg_engine.process_ppg_signal()
+            
+            if results['ready']:
+                bpm = results.get('bpm', 0)
+                if isinstance(bpm, (int, float)) and bpm > 0:
+                    web.session.bpm_history.append(float(bpm))
+                    
+                hrv_now    = results.get('hrv', 0) or 0
+                stress_now = results.get('stress_index', 0) or 0
+                if hrv_now > 0:
+                    if web.session.last_valid_hrv > 0:
+                        web.session.last_valid_hrv = 0.25 * hrv_now + 0.75 * web.session.last_valid_hrv
+                    else:
+                        web.session.last_valid_hrv = hrv_now
+                if stress_now > 0:
+                    if web.session.last_valid_stress > 0:
+                        web.session.last_valid_stress = 0.15 * stress_now + 0.85 * web.session.last_valid_stress
+                    else:
+                        web.session.last_valid_stress = stress_now
+                        
+                rr_val = results.get('rr', 0) or 0
+                rr_conf = results.get('rr_confidence', 0) or 0
+                if rr_conf < 10:
+                    rr_val = 0
+                    
+                web.session.metrics.update({
+                    'bpm':                  int(bpm) if isinstance(bpm, (int, float)) else 0,
+                    'confidence':           int(results.get('confidence', 0)),
+                    'status':               results.get('status', 'OK'),
+                    'snr_db':               results.get('snr_db', 0),
+                    'sqi':                  results.get('sqi', 0),
+                    'classification':       _classify(bpm),
+                    'ohi':                  results.get('confidence', 0),
+                    'stability':            results.get('stability_score', 0),
+                    'stability_indicator':  results.get('stability_indicator', '--'),
+                    'rr':                   rr_val,
+                    'rr_confidence':        rr_conf,
+                    'rr_classification':    _classify_respiratory_rate(rr_val),
+                    'hrv':                  web.session.last_valid_hrv,
+                    'stress_index':         web.session.last_valid_stress,
+                    'warnings':             warnings,
+                    'remark':               results.get('remark', ''),
+                    'estimated_lux':        lux,
+                    'motion_delta':         int(motion_delta),
+                    'is_live':              True,
+                    'calibration_done':     True,
+                    'face_detected':        True,
+                    'ppg_signal':           results.get('ppg_signal', [])[-150:],
+                    'calibration_progress': 100,
+                })
+            else:
+                web.session.metrics.update({
+                    'status':               'CALIBRATING',
+                    'warnings':             warnings,
+                    'is_live':              True,
+                    'calibration_done':     False,
+                    'estimated_lux':        lux,
+                    'motion_delta':         int(motion_delta),
+                    'face_detected':        True,
+                    'calibration_progress': results.get('calibration_progress', 0),
+                    'rr':                   results.get('rr', 0),
+                    'rr_confidence':        results.get('rr_confidence', 0),
+                    'rr_classification':    _classify_respiratory_rate(results.get('rr', 0)),
+                })
+        else:
+            web.session.metrics.update({
+                'status':               'DISCONNECTED',
+                'warnings':             ['No face detected'],
+                'face_detected':        False,
+            })
+            
+        _, buffer = cv2.imencode(".jpg", frame)
+        annotated_b64 = base64.b64encode(buffer).decode('utf-8')
+        
+        return jsonify({
+            'success': True,
+            'annotated_image': f"data:image/jpeg;base64,{annotated_b64}",
+            'metrics': web.session.metrics
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/chat', methods=['POST'])
 def chat_api():
     data = request.json or {}
     user_message = data.get('message', '')
     history = data.get('history', [])
     image_data = data.get('image', None)  # Base64 data: "data:image/jpeg;base64,..."
+    selected_patient_id = data.get('selected_patient_id', None)
     
     # Check if NVIDIA NIM key is present
     nvidia_key = os.getenv("NVIDIA_API_KEY")
     
     # Retrieve current active patient records from Neon
     patients = get_all_patients()
+    
+    # Check if user message explicitly matches any patient name in the database
+    matched_patient = None
+    for p in patients:
+        p_name = str(p.get('name', '')).lower()
+        if p_name and len(p_name) > 2 and p_name in user_message.lower():
+            matched_patient = p
+            break
+            
+    # Fallback to current selection if no explicit name was match in text
+    if not matched_patient and selected_patient_id:
+        matched_patient = next((p for p in patients if p.get('id') == selected_patient_id), None)
+
     patient_context = "\n\n=== CURRENT ACTIVE TRIAGE QUEUE & PATIENT RECORDS ===\n"
     if not patients:
         patient_context += "No patient records currently exist in the triage database.\n"
@@ -506,6 +656,19 @@ def chat_api():
                 f"  AI Clinical Assessment Trace: {p.get('triage_summary', 'N/A')}\n\n"
             )
             
+    focused_context = ""
+    if matched_patient:
+        focused_context = (
+            f"\n\n=== ACTIVE PATIENT CONTEXT FOCUS ===\n"
+            f"The clinician is currently asking questions about or focusing on patient **{matched_patient['name']}**.\n"
+            f"Record ID: {matched_patient['id']}\n"
+            f"Triage Acuity: ESI Level {matched_patient['esi_level']} (Priority Score: {matched_patient['priority_score']}/100)\n"
+            f"Active vitals: HR {matched_patient.get('heart_rate', '--')} BPM, Respiration {matched_patient.get('respiration', '--')} breaths/min, HRV {matched_patient.get('hrv', '--')} ms, Stress Index {matched_patient.get('stress_index', '--')}\n"
+            f"Primary Diagnosis: {matched_patient.get('primary_diagnosis', 'N/A')}\n"
+            f"Clinical Summary: {matched_patient.get('triage_summary', 'N/A')}\n"
+            f"Treat any queries referencing pronouns ('he', 'she', 'they', 'this patient', 'the patient') as querying this patient.\n"
+        )
+            
     try:
         if nvidia_key:
             from langchain_nvidia_ai_endpoints import ChatNVIDIA
@@ -520,6 +683,7 @@ def chat_api():
                 "patient by name, match it against the records, summarize their ESI score, vital statistics, "
                 "and explain their triage significance. Remain highly professional and outline any warnings (e.g. shock risk).\n"
                 + patient_context
+                + focused_context
             )
             messages = [SystemMessage(content=instructions)]
             
@@ -560,16 +724,9 @@ def chat_api():
             
         else:
             # Fallback simulator with database parsing
-            matched_patient = None
-            for p in patients:
-                p_name = str(p.get('name', '')).lower()
-                if p_name and p_name in user_message.lower():
-                    matched_patient = p
-                    break
-            
             if matched_patient:
                 response_text = (
-                    f"[en-US] [DEMO MODE: DATABASE DETECTED] I found a matching record for patient **{matched_patient['name']}**.\n\n"
+                    f"[en-US] [DEMO MODE: DATABASE MATCHED] I found a matching record for patient **{matched_patient['name']}**.\n\n"
                     f"* **Triage Acuity:** ESI Level {matched_patient['esi_level']} (Score: {matched_patient['priority_score']}/100)\n"
                     f"* **Vitals:** HR {matched_patient.get('heart_rate', '--')} BPM, Respiration {matched_patient.get('respiration', '--')} breaths/min, HRV {matched_patient.get('hrv', '--')} ms, Stress Index {matched_patient.get('stress_index', '--')}\n"
                     f"* **Clinical Indication:** {matched_patient.get('primary_diagnosis', 'N/A')}\n"
@@ -591,7 +748,10 @@ def chat_api():
                         "NVIDIA Llama Nemotron reasoning engine."
                     )
                 
-        return jsonify({'response': response_text})
+        return jsonify({
+            'response': response_text,
+            'matched_patient_id': matched_patient.get('id') if matched_patient else None
+        })
         
     except Exception as e:
         import traceback
