@@ -635,6 +635,23 @@ def chat_api():
             matched_patient = p
             break
             
+    # Fallback to partial word matching if no full match found
+    if not matched_patient:
+        msg_clean = re.sub(r'[^\w\s]', '', user_message.lower())
+        msg_words = [w.strip() for w in msg_clean.split() if len(w.strip()) >= 3]
+        for w in msg_words:
+            if w in ['the', 'and', 'for', 'you', 'are', 'not', 'but', 'can', 'get', 'was', 'were', 'out', 'hey', 'who', 'what', 'has', 'patient', 'triage']:
+                continue
+            for p in patients:
+                p_name = str(p.get('name', '')).lower()
+                first_name = p_name.split()[0] if p_name.split() else p_name
+                # Match first name or unique substring (e.g. "kush" matches "kushal raj g s")
+                if w == first_name or w in p_name:
+                    matched_patient = p
+                    break
+            if matched_patient:
+                break
+            
     # Fallback to current selection if no explicit name was match in text
     if not matched_patient and selected_patient_id:
         matched_patient = next((p for p in patients if p.get('id') == selected_patient_id), None)
@@ -748,6 +765,14 @@ def chat_api():
                         "NVIDIA Llama Nemotron reasoning engine."
                     )
                 
+        # Post-response check: if still no matched patient, check if the LLM output explicitly contains a patient's name
+        if not matched_patient:
+            for p in patients:
+                p_name = str(p.get('name', '')).lower()
+                if p_name and len(p_name) > 2 and p_name in response_text.lower():
+                    matched_patient = p
+                    break
+
         return jsonify({
             'response': response_text,
             'matched_patient_id': matched_patient.get('id') if matched_patient else None

@@ -69,6 +69,7 @@ export default function Home() {
   // Navigation & Layout states
   const [activeTab, setActiveTab] = useState<NavigationTab>('monitor');
   const [sidebarExpanded, setSidebarExpanded] = useState<boolean>(true);
+  const [speakingMessageIdx, setSpeakingMessageIdx] = useState<number | null>(null);
 
   // Connection and settings state
   const [backendOnline, setBackendOnline] = useState<boolean>(false);
@@ -173,6 +174,17 @@ export default function Home() {
   useEffect(() => {
     checkBackendStatus();
     const interval = setInterval(checkBackendStatus, 5000);
+    
+    // Warm up speech synthesis voices list early on mount
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.getVoices();
+      if (window.speechSynthesis.onvoiceschanged !== undefined) {
+        window.speechSynthesis.onvoiceschanged = () => {
+          window.speechSynthesis.getVoices();
+        };
+      }
+    }
+    
     return () => clearInterval(interval);
   }, []);
 
@@ -368,12 +380,68 @@ export default function Home() {
     }
   };
 
-  // 4. Voice TTS output
-  const speakText = (text: string) => {
+  // 4. Voice TTS output (with manual play/stop toggle)
+  const speakText = (text: string, index: number) => {
     if (typeof window !== 'undefined' && window.speechSynthesis) {
+      if (window.speechSynthesis.speaking && speakingMessageIdx === index) {
+        window.speechSynthesis.cancel();
+        setSpeakingMessageIdx(null);
+        return;
+      }
+      
       window.speechSynthesis.cancel();
-      const cleanMsg = text.replace(/^\[[a-z]{2}-[A-Z]{2}\]\s*/i, '');
+      
+      // Remove any brackets/metadata tags before reading
+      const cleanMsg = text.replace(/^\[[a-z]{2}-[A-Z]{2}\]\s*/i, '')
+                           .replace(/[*#`_]/g, ''); // Clean markdown characters
+                           
       const utterance = new SpeechSynthesisUtterance(cleanMsg);
+      
+      // Attempt to load premium clinical voice (prioritizing high-fidelity English female voices)
+      const voices = window.speechSynthesis.getVoices();
+      
+      // Filter English voices and strictly exclude known male voice identifiers
+      const enVoices = voices.filter(v => {
+        const name = v.name.toLowerCase();
+        const lang = v.lang.toLowerCase();
+        return lang.startsWith('en') && 
+               !name.includes('david') && 
+               !name.includes('male') && 
+               !name.includes('george') &&
+               !name.includes('richard') &&
+               !name.includes('mark') &&
+               !name.includes('harish') &&
+               !name.includes('ravi');
+      });
+
+      // Find the most natural/human-sounding English female voice from the filtered list
+      const femaleVoice = enVoices.find(v => {
+        const name = v.name.toLowerCase();
+        return name.includes('natural') || 
+               name.includes('online') || 
+               name.includes('google us english') || 
+               name.includes('jenny') || 
+               name.includes('aria') || 
+               name.includes('samantha') || 
+               name.includes('karen') ||
+               name.includes('zira') ||
+               name.includes('female');
+      }) || enVoices[0] || voices.find(v => v.lang.startsWith('en')) || voices[0];
+      
+      if (femaleVoice) {
+        utterance.voice = femaleVoice;
+      }
+      utterance.rate = 1.2;  // Brisk, clinical speech rate
+      utterance.pitch = 1.0; // Standard pitch (prevents robotic synthetic squeaking)
+      
+      utterance.onend = () => {
+        setSpeakingMessageIdx(null);
+      };
+      utterance.onerror = () => {
+        setSpeakingMessageIdx(null);
+      };
+      
+      setSpeakingMessageIdx(index);
       window.speechSynthesis.speak(utterance);
     }
   };
@@ -618,9 +686,9 @@ export default function Home() {
       if (data.response) {
         const modelMsg: ChatMessage = { role: 'model', content: data.response };
         setChatHistory([...updatedHistory, modelMsg]);
-        speakText(data.response);
         if (data.matched_patient_id) {
           setSelectedConsultPatientId(data.matched_patient_id);
+          await fetchQueue();
         }
       } else {
         setChatHistory([...updatedHistory, { role: 'model', content: `Error: ${data.error || 'No response.'}` }]);
@@ -1778,17 +1846,35 @@ export default function Home() {
                           {msg.role === 'user' ? 'Clinician' : 'ARIA'}
                         </span>
                         
-                        <div className={`p-3.5 rounded-2xl text-sm leading-relaxed font-semibold whitespace-pre-wrap ${
+                        <div className={`p-3.5 rounded-2xl text-sm leading-relaxed font-semibold whitespace-pre-wrap relative ${
                           msg.role === 'user' 
                             ? 'bg-sky-950/20 text-text-primary border border-sky-850/30 rounded-tr-none shadow-sm' 
-                            : 'bg-panel-card text-text-primary border border-panel-border rounded-tl-none shadow-sm'
+                            : 'bg-panel-card text-text-primary border border-panel-border rounded-tl-none shadow-sm pb-8'
                         }`}>
                           {msg.image && (
                             <div className="mb-2 max-w-[180px] rounded-lg overflow-hidden border border-panel-border shadow-sm">
                               <img src={msg.image} alt="Clinical record attachment" className="w-full h-auto object-cover" />
                             </div>
                           )}
-                          {msg.content.replace(/^\[[a-z]{2}-[A-Z]{2}\]\s*/i, '').replace(/\*\*/g, '').replace(/\* /g, '• ')}
+                          <div>
+                            {msg.content.replace(/^\[[a-z]{2}-[A-Z]{2}\]\s*/i, '').replace(/\*\*/g, '').replace(/\* /g, '• ')}
+                          </div>
+
+                          {/* Manual Speaker Icon Toggle for ARIA's messages */}
+                          {msg.role === 'model' && (
+                            <button
+                              type="button"
+                              onClick={() => speakText(msg.content, idx)}
+                              className={`absolute bottom-2 right-3 text-text-secondary transition-colors text-xs p-1 bg-panel-bg/60 rounded-md border flex items-center justify-center w-6 h-6 shadow-sm ${
+                                speakingMessageIdx === idx 
+                                  ? 'border-accent-cyan text-accent-cyan shadow-[0_0_10px_rgba(56,189,248,0.3)] animate-pulse' 
+                                  : 'border-panel-border/30 hover:border-accent-cyan/30 hover:text-accent-cyan'
+                              }`}
+                              title={speakingMessageIdx === idx ? "Mute/Stop Voice Output" : "Listen to this response"}
+                            >
+                              {speakingMessageIdx === idx ? '🔇' : '🔊'}
+                            </button>
+                          )}
                         </div>
                       </div>
                     ))
